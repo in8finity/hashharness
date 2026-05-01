@@ -38,7 +38,8 @@ Example:
       "links": {
         "prevHypothesisChange": {
           "kind": "single",
-          "target_types": ["HypothesisChange"]
+          "target_types": ["HypothesisChange"],
+          "chain_predecessor": true
         },
         "evidences": {
           "kind": "many",
@@ -51,6 +52,17 @@ Example:
 ```
 
 For every `many` link field, the server also stores a derived `<field>Hash` value based on the sorted list of referenced `record_sha256` values. For `evidences`, that becomes `evidencesHash`.
+
+### Chain head pointer
+
+A link rule may opt in to chain semantics with `"chain_predecessor": true`. Only `kind: "single"` links can be predecessors, and at most one link per type may be marked. When the flag is set:
+
+- The server tracks a per-`(work_package_id, item_type)` head pointer (the current chain tip's `record_sha256`).
+- For the **first** item in a chain, the predecessor link must be omitted.
+- For every subsequent `create_item`, the predecessor link must equal the current head; otherwise the write is rejected with `"head moved"`. After a successful write, the head atomically advances to the new record.
+- `find_tip` for chain types returns the head record directly (O(1)) instead of scanning by `created_at`.
+
+This forces append-only-from-tip and rejects concurrent forks. Without this flag, link rules behave like an ordinary single-target reference and offer no fork protection.
 
 ## Stored Item Shape
 

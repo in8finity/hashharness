@@ -558,6 +558,161 @@ class TextStoreTests(unittest.TestCase):
             self.assertEqual(tmp_files, [])
 
 
+class ChainPredecessorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.wall = AdvancingClock()
+        self.store = TextStore(self.tempdir.name, now_fn=self.wall)
+        self.store.set_schema(
+            {
+                "types": {
+                    "Evidence": {"links": {}},
+                    "HypothesisChange": {
+                        "links": {
+                            "prevHypothesisChange": {
+                                "kind": "single",
+                                "target_types": ["HypothesisChange"],
+                                "chain_predecessor": True,
+                            },
+                            "evidences": {
+                                "kind": "many",
+                                "target_types": ["Evidence"],
+                            },
+                        }
+                    },
+                }
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.store.flush_writes()
+        self.tempdir.cleanup()
+
+    def _create_change(self, *, text: str, title: str, prev: str | None = None) -> dict:
+        links: dict[str, object] = {}
+        if prev is not None:
+            links["prevHypothesisChange"] = prev
+        return self.store.create_item(
+            item_type="HypothesisChange",
+            text=text,
+            title=title,
+            work_package_id="wp-1",
+            links=links,
+        )
+
+    def test_first_item_must_omit_predecessor(self) -> None:
+        first = self._create_change(text="c1", title="C1")
+        # Subsequent first-item-style write (with prev omitted) is rejected because
+        # the chain already has a head.
+        with self.assertRaises(StorageError) as ctx:
+            self._create_change(text="c1b", title="C1B")
+        self.assertIn("must equal current head", str(ctx.exception))
+        self.assertEqual(self.store._get_head("wp-1", "HypothesisChange"), first["record_sha256"])
+
+    def test_first_item_rejects_supplied_predecessor(self) -> None:
+        # Bootstrap a chain in another work package so we have a valid HypothesisChange
+        # record to point at — isolates the "first item must omit prev" check from the
+        # generic "link target must exist" / type validation.
+        other = self.store.create_item(
+            item_type="HypothesisChange",
+            text="other-wp first",
+            title="Other",
+            work_package_id="wp-other",
+            links={},
+        )
+        with self.assertRaises(StorageError) as ctx:
+            self._create_change(text="c1", title="C1", prev=other["record_sha256"])
+        self.assertIn("must be omitted", str(ctx.exception))
+
+    def test_head_advances_on_successful_appends(self) -> None:
+        c1 = self._create_change(text="c1", title="C1")
+        c2 = self._create_change(text="c2", title="C2", prev=c1["record_sha256"])
+        c3 = self._create_change(text="c3", title="C3", prev=c2["record_sha256"])
+        self.assertEqual(self.store._get_head("wp-1", "HypothesisChange"), c3["record_sha256"])
+
+    def test_fork_attempt_is_rejected(self) -> None:
+        c1 = self._create_change(text="c1", title="C1")
+        c2 = self._create_change(text="c2", title="C2", prev=c1["record_sha256"])
+        # Attacker tries to fork off c1 after c2 has advanced the head.
+        with self.assertRaises(StorageError) as ctx:
+            self._create_change(text="c2-attacker", title="Fork", prev=c1["record_sha256"])
+        self.assertIn("head moved", str(ctx.exception))
+        # Head is still c2.
+        self.assertEqual(self.store._get_head("wp-1", "HypothesisChange"), c2["record_sha256"])
+
+    def test_find_tip_returns_head_not_latest_created_at(self) -> None:
+        c1 = self._create_change(text="c1", title="C1")
+        c2 = self._create_change(text="c2", title="C2", prev=c1["record_sha256"])
+        tip = self.store.find_tip("wp-1", "HypothesisChange")
+        self.assertEqual(tip["record_sha256"], c2["record_sha256"])
+
+    def test_head_persists_across_store_reopen(self) -> None:
+        c1 = self._create_change(text="c1", title="C1")
+        c2 = self._create_change(text="c2", title="C2", prev=c1["record_sha256"])
+        self.store.flush_writes()
+
+        reopened = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        try:
+            self.assertEqual(
+                reopened._get_head("wp-1", "HypothesisChange"),
+                c2["record_sha256"],
+            )
+            # And appending must reference c2, not c1.
+            with self.assertRaises(StorageError):
+                reopened.create_item(
+                    item_type="HypothesisChange",
+                    text="rogue",
+                    title="Rogue",
+                    work_package_id="wp-1",
+                    links={"prevHypothesisChange": c1["record_sha256"]},
+                )
+        finally:
+            reopened.flush_writes()
+
+    def test_schema_rejects_chain_predecessor_on_many_link(self) -> None:
+        with self.assertRaises(StorageError) as ctx:
+            self.store.set_schema(
+                {
+                    "types": {
+                        "Bad": {
+                            "links": {
+                                "prevs": {
+                                    "kind": "many",
+                                    "target_types": ["Bad"],
+                                    "chain_predecessor": True,
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        self.assertIn("chain_predecessor", str(ctx.exception))
+
+    def test_schema_rejects_two_chain_predecessor_links_on_one_type(self) -> None:
+        with self.assertRaises(StorageError) as ctx:
+            self.store.set_schema(
+                {
+                    "types": {
+                        "Bad": {
+                            "links": {
+                                "a": {
+                                    "kind": "single",
+                                    "target_types": ["Bad"],
+                                    "chain_predecessor": True,
+                                },
+                                "b": {
+                                    "kind": "single",
+                                    "target_types": ["Bad"],
+                                    "chain_predecessor": True,
+                                },
+                            }
+                        }
+                    }
+                }
+            )
+        self.assertIn("at most one", str(ctx.exception))
+
+
 class HttpMCPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()

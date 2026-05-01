@@ -24,6 +24,7 @@ class LinkRule:
     kind: str
     target_types: tuple[str, ...]
     required: bool = False
+    chain_predecessor: bool = False
 
 
 @dataclass
@@ -60,6 +61,7 @@ class BaseTextStore:
         self.work_package_cache: dict[str, CachedWorkPackage] = {}
         self.item_to_work_package: dict[str, str] = {}
         self.record_to_text_sha256: dict[str, str] = {}
+        self.heads: dict[tuple[str, str], str] = {}
         self.cache_lock = threading.RLock()
         self.write_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.pending_writes: set[str] = set()
@@ -93,6 +95,14 @@ class BaseTextStore:
         raise NotImplementedError
 
     def _persist_item(self, item: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def _backend_get_head(self, work_package_id: str, item_type: str) -> str | None:
+        raise NotImplementedError
+
+    def _backend_set_head(
+        self, work_package_id: str, item_type: str, record_sha256: str
+    ) -> None:
         raise NotImplementedError
 
     # ------------------------------------------------------------------- public
@@ -193,8 +203,18 @@ class BaseTextStore:
                     "An item with the same text sha256 already exists and cannot be updated"
                 )
 
+            predecessor_rule = self._chain_predecessor_rule(rules)
+            if predecessor_rule is not None:
+                self._enforce_head_compare_and_swap(
+                    work_package_id, item_type, predecessor_rule, validated_links
+                )
+
             self._cache_item(item)
             self._enqueue_write(item)
+
+            if predecessor_rule is not None:
+                self._set_head(work_package_id, item_type, item["record_sha256"])
+
             return item
 
     def find_items(
@@ -361,6 +381,21 @@ class BaseTextStore:
         }
 
     def find_tip(self, work_package_id: str, item_type: str) -> dict[str, Any]:
+        rule = self._chain_predecessor_rule_for_type(item_type)
+        if rule is not None:
+            head = self._get_head(work_package_id, item_type)
+            if head is None:
+                raise StorageError(
+                    f"No items found for work_package_id={work_package_id} and type={item_type}"
+                )
+            item = self._resolve_record_sha256(head)
+            if item is None:
+                raise StorageError(
+                    f"Head record not found for work_package_id={work_package_id} "
+                    f"and type={item_type}: {head}"
+                )
+            return item
+
         cached = self._get_or_load_work_package_cache(work_package_id)
         candidates = [
             item for item in cached.items_by_sha.values() if item.get("type") == item_type
@@ -551,8 +586,16 @@ class BaseTextStore:
             links = definition.get("links", {})
             if not isinstance(links, dict):
                 raise StorageError(f"links for type {type_name} must be an object")
+            chain_predecessor_count = 0
             for link_name, link_rule in links.items():
-                self._parse_rule(link_name, link_rule)
+                rule = self._parse_rule(link_name, link_rule)
+                if rule.chain_predecessor:
+                    chain_predecessor_count += 1
+            if chain_predecessor_count > 1:
+                raise StorageError(
+                    f"Type {type_name} declares {chain_predecessor_count} "
+                    "chain_predecessor links; at most one is allowed"
+                )
 
     def _rules_for_type(self, schema: dict[str, Any], item_type: str) -> dict[str, LinkRule]:
         types = schema.get("types", {})
@@ -567,17 +610,23 @@ class BaseTextStore:
         kind = rule.get("kind")
         target_types = rule.get("target_types", [])
         required = bool(rule.get("required", False))
+        chain_predecessor = bool(rule.get("chain_predecessor", False))
         if kind not in {"single", "many"}:
             raise StorageError(f"Link rule {name} has unsupported kind {kind}")
         if not isinstance(target_types, list) or not target_types or not all(
             isinstance(value, str) and value for value in target_types
         ):
             raise StorageError(f"Link rule {name} must declare non-empty target_types")
+        if chain_predecessor and kind != "single":
+            raise StorageError(
+                f"Link rule {name} has chain_predecessor=true; only kind=single is supported"
+            )
         return LinkRule(
             name=name,
             kind=kind,
             target_types=tuple(target_types),
             required=required,
+            chain_predecessor=chain_predecessor,
         )
 
     def _validate_links(
@@ -614,6 +663,100 @@ class BaseTextStore:
             validated[f"{name}Hash"] = sha256_joined(value)
 
         return validated
+
+    def _chain_predecessor_rule(self, rules: dict[str, LinkRule]) -> LinkRule | None:
+        for rule in rules.values():
+            if rule.chain_predecessor:
+                return rule
+        return None
+
+    def _chain_predecessor_rule_for_type(self, item_type: str) -> LinkRule | None:
+        schema = self.get_schema()
+        types = schema.get("types", {})
+        if item_type not in types:
+            return None
+        rules = self._rules_for_type(schema, item_type)
+        return self._chain_predecessor_rule(rules)
+
+    def _enforce_head_compare_and_swap(
+        self,
+        work_package_id: str,
+        item_type: str,
+        predecessor_rule: LinkRule,
+        validated_links: dict[str, Any],
+    ) -> None:
+        current_head = self._get_head(work_package_id, item_type)
+        supplied_prev = validated_links.get(predecessor_rule.name)
+        if current_head is None:
+            if supplied_prev is not None:
+                raise StorageError(
+                    f"Chain {item_type} in work_package_id={work_package_id} is empty; "
+                    f"link {predecessor_rule.name} must be omitted for the first item"
+                )
+            return
+        if supplied_prev is None:
+            raise StorageError(
+                f"Chain head exists for {item_type} in work_package_id={work_package_id}; "
+                f"link {predecessor_rule.name} must equal current head {current_head}"
+            )
+        if supplied_prev != current_head:
+            raise StorageError(
+                f"Chain head moved for {item_type} in work_package_id={work_package_id}: "
+                f"expected {predecessor_rule.name}={current_head}, got {supplied_prev}"
+            )
+
+    def _get_head(self, work_package_id: str, item_type: str) -> str | None:
+        key = (work_package_id, item_type)
+        with self.cache_lock:
+            if key in self.heads:
+                return self.heads[key]
+        persisted = self._backend_get_head(work_package_id, item_type)
+        if persisted is not None:
+            with self.cache_lock:
+                self.heads[key] = persisted
+            return persisted
+        return self._bootstrap_head(work_package_id, item_type)
+
+    def _set_head(
+        self, work_package_id: str, item_type: str, record_sha256: str
+    ) -> None:
+        with self.cache_lock:
+            self.heads[(work_package_id, item_type)] = record_sha256
+        self._backend_set_head(work_package_id, item_type, record_sha256)
+
+    def _bootstrap_head(self, work_package_id: str, item_type: str) -> str | None:
+        rule = self._chain_predecessor_rule_for_type(item_type)
+        if rule is None:
+            return None
+        cached = self._get_or_load_work_package_cache(work_package_id)
+        items = [
+            item
+            for item in cached.items_by_sha.values()
+            if item.get("type") == item_type
+        ]
+        if not items:
+            return None
+        referenced: set[str] = set()
+        for item in items:
+            prev = item.get("links", {}).get(rule.name)
+            if prev:
+                referenced.add(prev)
+        tips = [
+            item for item in items if item.get("record_sha256") not in referenced
+        ]
+        if len(tips) == 0:
+            raise StorageError(
+                f"No chain tip found for work_package_id={work_package_id} "
+                f"and type={item_type} (cycle in predecessor links?)"
+            )
+        if len(tips) > 1:
+            raise StorageError(
+                f"Chain {item_type} in work_package_id={work_package_id} has "
+                f"{len(tips)} unreferenced tips; manual reconciliation required"
+            )
+        head = tips[0]["record_sha256"]
+        self._set_head(work_package_id, item_type, head)
+        return head
 
     def _validate_target(self, link_name: str, record_sha256: str, rule: LinkRule) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", record_sha256):
@@ -792,6 +935,8 @@ class FilesystemTextStore(BaseTextStore):
         self.root = Path(root)
         self.items_dir = self.root / "items"
         self.schema_path = self.root / "schema.json"
+        self.heads_path = self.root / "heads.json"
+        self.heads_lock = threading.RLock()
         super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
 
     def _init_backend(self) -> None:
@@ -832,6 +977,40 @@ class FilesystemTextStore(BaseTextStore):
     def _persist_item(self, item: dict[str, Any]) -> None:
         item_path = self.items_dir / f"{item['text_sha256']}.json"
         self._persist_item_to_disk(item_path, item)
+
+    def _heads_key(self, work_package_id: str, item_type: str) -> str:
+        return f"{work_package_id}\x00{item_type}"
+
+    def _read_heads_file(self) -> dict[str, str]:
+        if not self.heads_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.heads_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Corrupt heads.json: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise StorageError("Corrupt heads.json: expected object")
+        return payload
+
+    def _backend_get_head(self, work_package_id: str, item_type: str) -> str | None:
+        with self.heads_lock:
+            heads = self._read_heads_file()
+        return heads.get(self._heads_key(work_package_id, item_type))
+
+    def _backend_set_head(
+        self, work_package_id: str, item_type: str, record_sha256: str
+    ) -> None:
+        with self.heads_lock:
+            heads = self._read_heads_file()
+            heads[self._heads_key(work_package_id, item_type)] = record_sha256
+            tmp_path = self.heads_path.with_name(
+                f".{self.heads_path.name}.{threading.get_ident()}.tmp"
+            )
+            tmp_path.write_text(
+                json.dumps(heads, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.heads_path)
 
     def _persist_item_to_disk(self, item_path: Path, item: dict[str, Any]) -> None:
         tmp_path = item_path.with_name(f".{item_path.name}.{threading.get_ident()}.tmp")
@@ -909,6 +1088,14 @@ class SqliteTextStore(BaseTextStore):
                 "payload TEXT NOT NULL"
                 ")"
             )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS heads ("
+                "work_package_id TEXT NOT NULL, "
+                "item_type TEXT NOT NULL, "
+                "record_sha256 TEXT NOT NULL, "
+                "PRIMARY KEY (work_package_id, item_type)"
+                ")"
+            )
 
     def close(self) -> None:
         with self.db_lock:
@@ -978,6 +1165,27 @@ class SqliteTextStore(BaseTextStore):
                 "  work_package_id = excluded.work_package_id, "
                 "  payload = excluded.payload",
                 (item["text_sha256"], item["work_package_id"], payload),
+            )
+
+    def _backend_get_head(self, work_package_id: str, item_type: str) -> str | None:
+        with self.db_lock:
+            row = self.conn.execute(
+                "SELECT record_sha256 FROM heads "
+                "WHERE work_package_id = ? AND item_type = ?",
+                (work_package_id, item_type),
+            ).fetchone()
+        return row[0] if row else None
+
+    def _backend_set_head(
+        self, work_package_id: str, item_type: str, record_sha256: str
+    ) -> None:
+        with self.db_lock:
+            self.conn.execute(
+                "INSERT INTO heads (work_package_id, item_type, record_sha256) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(work_package_id, item_type) DO UPDATE SET "
+                "  record_sha256 = excluded.record_sha256",
+                (work_package_id, item_type, record_sha256),
             )
 
     def _decode_payload(

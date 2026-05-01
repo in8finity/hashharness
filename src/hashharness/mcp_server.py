@@ -172,7 +172,11 @@ class MCPApplication:
                     "created_at is server-stamped at write time and cannot be supplied "
                     "by the caller. Link values are the target items' record_sha256 "
                     "(full record hash, binding text + metadata + links), not text_sha256. "
-                    "Referenced records must already exist."
+                    "Referenced records must already exist. If the type's schema declares "
+                    "a chain_predecessor link, that link's value must equal the current "
+                    "head record_sha256 for (work_package_id, type) — or be omitted for "
+                    "the first item in the chain. The head advances on each successful "
+                    "create; concurrent forks are rejected with 'head moved'."
                 ),
                 "inputSchema": {
                     "type": "object",
