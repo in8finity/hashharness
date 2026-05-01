@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -17,11 +18,26 @@ from hashharness.storage import (
 )
 
 
+class AdvancingClock:
+    """Deterministic wall clock for tests; advances 1 second per call."""
+
+    def __init__(self, start: datetime | None = None) -> None:
+        self.current = start or datetime(2026, 4, 25, 10, 0, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        result = self.current
+        self.current = self.current + timedelta(seconds=1)
+        return result
+
+
 class TextStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
         self.now = 0.0
-        self.store = TextStore(self.tempdir.name, clock=lambda: self.now)
+        self.wall = AdvancingClock()
+        self.store = TextStore(
+            self.tempdir.name, clock=lambda: self.now, now_fn=self.wall
+        )
         self.store.set_schema(
             {
                 "types": {
@@ -52,7 +68,6 @@ class TextStoreTests(unittest.TestCase):
             text="lab note 1",
             title="Evidence 1",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
 
         fetched = self.store.get_item(item["text_sha256"])
@@ -69,7 +84,6 @@ class TextStoreTests(unittest.TestCase):
             text="lab note with metadata",
             title="Evidence With Attributes",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
             attributes={"author": "alice", "score": 3, "tags": ["lab", "sample"]},
         )
 
@@ -84,21 +98,18 @@ class TextStoreTests(unittest.TestCase):
             text="evidence a",
             title="A",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         evidence_b = self.store.create_item(
             item_type="Evidence",
             text="evidence b",
             title="B",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:31:00Z",
         )
         previous = self.store.create_item(
             item_type="HypothesisChange",
             text="old change",
             title="Old",
             work_package_id="wp-1",
-            created_at="2026-04-24T09:00:00Z",
             links={},
         )
 
@@ -107,7 +118,6 @@ class TextStoreTests(unittest.TestCase):
             text="new hypothesis",
             title="New",
             work_package_id="wp-1",
-            created_at="2026-04-25T11:00:00Z",
             links={
                 "prevHypothesisChange": previous["record_sha256"],
                 "evidences": [evidence_b["record_sha256"], evidence_a["record_sha256"]],
@@ -126,14 +136,12 @@ class TextStoreTests(unittest.TestCase):
             text="contains critical anomaly",
             title="Anomaly",
             work_package_id="wp-9",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.create_item(
             item_type="Evidence",
             text="boring baseline",
             title="Baseline",
             work_package_id="wp-9",
-            created_at="2026-04-25T10:31:00Z",
         )
 
         results = self.store.find_items(query="critical", field="text")
@@ -146,7 +154,6 @@ class TextStoreTests(unittest.TestCase):
             text="same text",
             title="Original",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
 
         with self.assertRaises(StorageError):
@@ -155,7 +162,6 @@ class TextStoreTests(unittest.TestCase):
                 text="same text",
                 title="Changed title",
                 work_package_id="wp-2",
-                created_at="2026-04-26T10:30:00Z",
             )
 
     def test_rejects_wrong_link_type(self) -> None:
@@ -164,7 +170,6 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
 
         with self.assertRaises(StorageError):
@@ -173,7 +178,6 @@ class TextStoreTests(unittest.TestCase):
                 text="bad refs",
                 title="Bad",
                 work_package_id="wp-1",
-                created_at="2026-04-25T11:00:00Z",
                 links={"prevHypothesisChange": evidence["record_sha256"]},
             )
 
@@ -183,7 +187,6 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         # Sanity: with non-empty meta, the two ids diverge.
         self.assertNotEqual(evidence["text_sha256"], evidence["record_sha256"])
@@ -194,7 +197,6 @@ class TextStoreTests(unittest.TestCase):
             text="hypothesis",
             title="Hyp",
             work_package_id="wp-1",
-            created_at="2026-04-25T11:00:00Z",
             links={"evidences": [evidence["record_sha256"]]},
         )
         self.assertEqual(change["links"]["evidences"], [evidence["record_sha256"]])
@@ -206,19 +208,26 @@ class TextStoreTests(unittest.TestCase):
                 text="hypothesis by text",
                 title="HypByText",
                 work_package_id="wp-1",
-                created_at="2026-04-25T11:01:00Z",
                 links={"evidences": [evidence["text_sha256"]]},
             )
 
-    def test_rejects_created_at_without_timezone(self) -> None:
-        with self.assertRaises(StorageError):
-            self.store.create_item(
-                item_type="Evidence",
-                text="bad time",
-                title="Bad Time",
-                work_package_id="wp-1",
-                created_at="2026-04-25T10:30:00",
-            )
+    def test_created_at_is_server_stamped_and_monotonic(self) -> None:
+        first = self.store.create_item(
+            item_type="Evidence",
+            text="first",
+            title="First",
+            work_package_id="wp-1",
+        )
+        second = self.store.create_item(
+            item_type="Evidence",
+            text="second",
+            title="Second",
+            work_package_id="wp-1",
+        )
+        # Server-stamped wall clock advances; both timestamps are well-formed UTC.
+        self.assertTrue(first["created_at"].endswith("+00:00"))
+        self.assertTrue(second["created_at"].endswith("+00:00"))
+        self.assertLess(first["created_at"], second["created_at"])
 
     def test_rejects_non_object_attributes(self) -> None:
         with self.assertRaises(StorageError):
@@ -227,7 +236,6 @@ class TextStoreTests(unittest.TestCase):
                 text="bad attrs",
                 title="Bad Attrs",
                 work_package_id="wp-1",
-                created_at="2026-04-25T10:30:00Z",
                 attributes=["not", "an", "object"],
             )
 
@@ -237,21 +245,18 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         previous = self.store.create_item(
             item_type="HypothesisChange",
             text="old hypothesis",
             title="Old",
             work_package_id="wp-1",
-            created_at="2026-04-25T11:00:00Z",
         )
         current = self.store.create_item(
             item_type="HypothesisChange",
             text="current hypothesis",
             title="Current",
             work_package_id="wp-1",
-            created_at="2026-04-25T12:00:00Z",
             links={
                 "prevHypothesisChange": previous["record_sha256"],
                 "evidences": [evidence["record_sha256"]],
@@ -269,21 +274,18 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         previous = self.store.create_item(
             item_type="HypothesisChange",
             text="old hypothesis",
             title="Old",
             work_package_id="wp-1",
-            created_at="2026-04-25T11:00:00Z",
         )
         current = self.store.create_item(
             item_type="HypothesisChange",
             text="current hypothesis",
             title="Current",
             work_package_id="wp-1",
-            created_at="2026-04-25T12:00:00Z",
             links={
                 "prevHypothesisChange": previous["record_sha256"],
                 "evidences": [evidence["record_sha256"]],
@@ -309,14 +311,12 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         change = self.store.create_item(
             item_type="HypothesisChange",
             text="current hypothesis",
             title="Current",
             work_package_id="wp-1",
-            created_at="2026-04-25T12:00:00Z",
             links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.create_item(
@@ -324,7 +324,6 @@ class TextStoreTests(unittest.TestCase):
             text="other package",
             title="Other",
             work_package_id="wp-2",
-            created_at="2026-04-25T13:00:00Z",
         )
 
         result = self.store.get_work_package("wp-1")
@@ -343,14 +342,12 @@ class TextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.create_item(
             item_type="HypothesisChange",
             text="current hypothesis",
             title="Current",
             work_package_id="wp-1",
-            created_at="2026-04-25T12:00:00Z",
             links={"evidences": [evidence["record_sha256"]]},
         )
 
@@ -366,7 +363,6 @@ class TextStoreTests(unittest.TestCase):
             text="status changed for user",
             title="Relevant",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
             attributes={"event": "status-changed", "kind": "audit"},
         )
         self.store.create_item(
@@ -374,7 +370,6 @@ class TextStoreTests(unittest.TestCase):
             text="different event",
             title="Irrelevant",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:31:00Z",
             attributes={"event": "user-created", "kind": "audit"},
         )
         self.store.flush_writes()
@@ -390,21 +385,18 @@ class TextStoreTests(unittest.TestCase):
             text="older evidence",
             title="Older",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         latest = self.store.create_item(
             item_type="Evidence",
             text="latest evidence",
             title="Latest",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:31:00Z",
         )
         self.store.create_item(
             item_type="HypothesisChange",
             text="other type",
             title="Other Type",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:32:00Z",
         )
         self.store.flush_writes()
 
@@ -419,7 +411,6 @@ class TextStoreTests(unittest.TestCase):
             text="valid evidence",
             title="Valid",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.flush_writes()
         (self.store.items_dir / ("0" * 64 + ".json")).write_text("", encoding="utf-8")
@@ -435,7 +426,6 @@ class TextStoreTests(unittest.TestCase):
             text="cached evidence",
             title="Cached",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.flush_writes()
         self.assertIn("wp-1", self.store.work_package_cache)
@@ -452,14 +442,12 @@ class TextStoreTests(unittest.TestCase):
             text="cached evidence",
             title="Cached",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.create_item(
             item_type="Evidence",
             text="other package item",
             title="Other",
             work_package_id="wp-2",
-            created_at="2026-04-25T10:31:00Z",
         )
         self.store.flush_writes()
 
@@ -477,7 +465,6 @@ class TextStoreTests(unittest.TestCase):
             text="stable text",
             title="Stable",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.flush_writes()
         item_path = self.store.items_dir / f"{item['text_sha256']}.json"
@@ -558,7 +545,6 @@ class TextStoreTests(unittest.TestCase):
                 text="background write",
                 title="Background Write",
                 work_package_id="wp-1",
-                created_at="2026-04-25T10:30:00Z",
             )
             item_path = slow_store.items_dir / f"{item['text_sha256']}.json"
 
@@ -575,7 +561,8 @@ class TextStoreTests(unittest.TestCase):
 class HttpMCPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
-        self.store = TextStore(self.tempdir.name)
+        self.wall = AdvancingClock()
+        self.store = TextStore(self.tempdir.name, now_fn=self.wall)
         self.server = HttpMCPServer(MCPApplication(self.store), "127.0.0.1", 8000)
 
     def tearDown(self) -> None:
@@ -631,7 +618,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Observation A",
                         "attributes": {"source": "lab"},
                         "text": "The sample changed color after heating.",
@@ -652,7 +638,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "HypothesisChange",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T12:00:00Z",
                         "title": "Current hypothesis",
                         "text": "Updated hypothesis.",
                         "links": {"evidences": [evidence_hash]},
@@ -703,7 +688,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Observation A",
                         "text": "The sample changed color after heating.",
                     },
@@ -738,7 +722,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Observation A",
                         "text": "The sample changed color after heating.",
                         "attributes": {"event": "status-changed"},
@@ -757,7 +740,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:31:00Z",
                         "title": "Observation B",
                         "text": "Other event.",
                         "attributes": {"event": "user-created"},
@@ -808,7 +790,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Observation A",
                         "text": "The sample changed color after heating.",
                         "return": "full",
@@ -855,7 +836,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Old",
                         "text": "old",
                         "return": "full",
@@ -873,7 +853,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:31:00Z",
                         "title": "New",
                         "text": "new",
                         "return": "full",
@@ -932,7 +911,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "Evidence",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T10:30:00Z",
                         "title": "Observation A",
                         "attributes": {"source": "lab"},
                         "text": "The sample changed color after heating.",
@@ -952,7 +930,6 @@ class HttpMCPServerTests(unittest.TestCase):
                     "arguments": {
                         "type": "HypothesisChange",
                         "work_package_id": "wp-1",
-                        "created_at": "2026-04-25T12:00:00Z",
                         "title": "Current hypothesis",
                         "text": "Updated hypothesis.",
                         "links": {"evidences": [evidence_hash]},
@@ -1009,9 +986,11 @@ class SqliteTextStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
         self.now = 0.0
+        self.wall = AdvancingClock()
         self.store = SqliteTextStore(
             f"{self.tempdir.name}/hashharness.sqlite",
             clock=lambda: self.now,
+            now_fn=self.wall,
         )
         self.store.set_schema(
             {
@@ -1044,7 +1023,6 @@ class SqliteTextStoreTests(unittest.TestCase):
             text="sqlite-backed evidence",
             title="Evidence",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
             attributes={"author": "alice"},
         )
         self.store.flush_writes()
@@ -1060,7 +1038,6 @@ class SqliteTextStoreTests(unittest.TestCase):
             text="durable evidence",
             title="Durable",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.flush_writes()
         db_path = self.store.db_path
@@ -1081,21 +1058,18 @@ class SqliteTextStoreTests(unittest.TestCase):
             text="contains critical anomaly",
             title="Anomaly",
             work_package_id="wp-9",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.create_item(
             item_type="Evidence",
             text="boring baseline",
             title="Baseline",
             work_package_id="wp-9",
-            created_at="2026-04-25T10:31:00Z",
         )
         self.store.create_item(
             item_type="HypothesisChange",
             text="hypothesis pointing at anomaly",
             title="Hyp",
             work_package_id="wp-9",
-            created_at="2026-04-25T10:32:00Z",
             links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.flush_writes()
@@ -1113,7 +1087,6 @@ class SqliteTextStoreTests(unittest.TestCase):
             text="same text",
             title="Original",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         self.store.flush_writes()
         # Drop cache to force the conflict path through the backend.
@@ -1124,7 +1097,6 @@ class SqliteTextStoreTests(unittest.TestCase):
                 text="same text",
                 title="Different",
                 work_package_id="wp-2",
-                created_at="2026-04-26T10:30:00Z",
             )
 
     def test_verify_chain_round_trip(self) -> None:
@@ -1133,14 +1105,12 @@ class SqliteTextStoreTests(unittest.TestCase):
             text="fact",
             title="Fact",
             work_package_id="wp-1",
-            created_at="2026-04-25T10:30:00Z",
         )
         change = self.store.create_item(
             item_type="HypothesisChange",
             text="current hypothesis",
             title="Current",
             work_package_id="wp-1",
-            created_at="2026-04-25T12:00:00Z",
             links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.flush_writes()
@@ -1155,7 +1125,7 @@ class MigrateToolTests(unittest.TestCase):
         from hashharness.migrate import migrate
 
         with TemporaryDirectory() as src_dir, TemporaryDirectory() as dst_dir:
-            fs_store = TextStore(src_dir)
+            fs_store = TextStore(src_dir, now_fn=AdvancingClock())
             fs_store.set_schema(
                 {
                     "types": {
@@ -1176,7 +1146,6 @@ class MigrateToolTests(unittest.TestCase):
                 text="lab note",
                 title="Evidence",
                 work_package_id="wp-1",
-                created_at="2026-04-25T10:30:00Z",
                 attributes={"author": "alice"},
             )
             change = fs_store.create_item(
@@ -1184,7 +1153,6 @@ class MigrateToolTests(unittest.TestCase):
                 text="hypothesis",
                 title="Hyp",
                 work_package_id="wp-1",
-                created_at="2026-04-25T11:00:00Z",
                 links={"evidences": [evidence["record_sha256"]]},
             )
             fs_store.flush_writes()

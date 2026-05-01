@@ -52,9 +52,11 @@ class BaseTextStore:
         *,
         cache_ttl_seconds: float = 300.0,
         clock: Any | None = None,
+        now_fn: Any | None = None,
     ) -> None:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.clock = clock or monotonic
+        self.now_fn = now_fn or (lambda: datetime.now(UTC))
         self.work_package_cache: dict[str, CachedWorkPackage] = {}
         self.item_to_work_package: dict[str, str] = {}
         self.record_to_text_sha256: dict[str, str] = {}
@@ -127,7 +129,6 @@ class BaseTextStore:
         text: str,
         title: str,
         work_package_id: str,
-        created_at: str,
         attributes: dict[str, Any] | None = None,
         links: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -136,7 +137,7 @@ class BaseTextStore:
         text_hash = sha256_text(text)
 
         validated_links = self._validate_links(rules, links or {})
-        normalized_created_at = self._validate_datetime(created_at)
+        normalized_created_at = self._validate_datetime(self.now_fn().isoformat())
         validated_attributes = self._validate_attributes(attributes)
         meta_sha256 = self._meta_sha256(
             item_type=item_type,
@@ -162,7 +163,6 @@ class BaseTextStore:
             "attributes": validated_attributes,
             "text": text,
             "links": validated_links,
-            "stored_at": datetime.now(UTC).isoformat(),
         }
 
         # Hold cache_lock continuously across the duplicate check and the
@@ -393,6 +393,7 @@ class BaseTextStore:
     def _same_item(self, existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
         comparable_existing = dict(existing)
         comparable_candidate = dict(candidate)
+        # stored_at was removed; pop defensively for legacy items still on disk.
         comparable_existing.pop("stored_at", None)
         comparable_candidate.pop("stored_at", None)
         return comparable_existing == comparable_candidate
@@ -786,11 +787,12 @@ class FilesystemTextStore(BaseTextStore):
         *,
         cache_ttl_seconds: float = 300.0,
         clock: Any | None = None,
+        now_fn: Any | None = None,
     ) -> None:
         self.root = Path(root)
         self.items_dir = self.root / "items"
         self.schema_path = self.root / "schema.json"
-        super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock)
+        super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
 
     def _init_backend(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -873,11 +875,12 @@ class SqliteTextStore(BaseTextStore):
         *,
         cache_ttl_seconds: float = 300.0,
         clock: Any | None = None,
+        now_fn: Any | None = None,
     ) -> None:
         self.db_path = Path(path)
         self.db_lock = threading.RLock()
         self.conn: sqlite3.Connection | None = None
-        super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock)
+        super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
 
     def _init_backend(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1003,10 +1006,15 @@ def make_store(
     *,
     cache_ttl_seconds: float = 300.0,
     clock: Any | None = None,
+    now_fn: Any | None = None,
 ) -> BaseTextStore:
     normalized = (backend or "filesystem").lower()
     if normalized == "filesystem":
-        return FilesystemTextStore(path, cache_ttl_seconds=cache_ttl_seconds, clock=clock)
+        return FilesystemTextStore(
+            path, cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn
+        )
     if normalized == "sqlite":
-        return SqliteTextStore(path, cache_ttl_seconds=cache_ttl_seconds, clock=clock)
+        return SqliteTextStore(
+            path, cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn
+        )
     raise StorageError(f"Unsupported storage backend: {backend}")

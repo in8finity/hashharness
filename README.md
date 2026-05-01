@@ -62,7 +62,7 @@ For every `many` link field, the server also stores a derived `<field>Hash` valu
   "links_sha256": "<sha256(links)>",
   "record_sha256": "<sha256(text_sha256 + meta_sha256 + links_sha256)>",
   "work_package_id": "wp-123",
-  "created_at": "2026-04-25T10:30:00Z",
+  "created_at": "2026-04-25T10:30:00+00:00",
   "title": "Updated hypothesis",
   "attributes": {
     "author": "alice",
@@ -73,10 +73,11 @@ For every `many` link field, the server also stores a derived `<field>Hash` valu
     "prevHypothesisChange": "<target record_sha256>",
     "evidences": ["<target record_sha256>", "<target record_sha256>"],
     "evidencesHash": "<sha256(sorted target record_sha256 values)>"
-  },
-  "stored_at": "2026-04-25T10:00:00+00:00"
+  }
 }
 ```
+
+`created_at` is **server-stamped** at write time. The MCP `create_item` tool rejects any caller-supplied `created_at`. This prevents backdating: the timestamp in `meta_sha256` reflects when the server actually accepted the write, not what the client claimed.
 
 ## MCP Tools
 

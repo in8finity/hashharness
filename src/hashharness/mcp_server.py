@@ -18,7 +18,6 @@ ITEM_FIELD_NAMES = {
     "links_sha256",
     "meta_sha256",
     "record_sha256",
-    "stored_at",
     "text",
     "text_sha256",
     "title",
@@ -82,12 +81,15 @@ class MCPApplication:
         if name == "get_schema":
             return self._tool_result(self.store.get_schema())
         if name == "create_item":
+            if "created_at" in arguments:
+                raise StorageError(
+                    "created_at is server-stamped and cannot be supplied by the caller"
+                )
             result = self.store.create_item(
                 item_type=arguments["type"],
                 text=arguments["text"],
                 title=arguments["title"],
                 work_package_id=arguments["work_package_id"],
-                created_at=arguments["created_at"],
                 attributes=arguments.get("attributes"),
                 links=arguments.get("links", {}),
             )
@@ -167,8 +169,9 @@ class MCPApplication:
                 "name": "create_item",
                 "description": (
                     "Create an immutable text item. Its identifier is sha256(text). "
-                    "Link values are the target items' record_sha256 (full record hash, "
-                    "binding text + metadata + links), not text_sha256. "
+                    "created_at is server-stamped at write time and cannot be supplied "
+                    "by the caller. Link values are the target items' record_sha256 "
+                    "(full record hash, binding text + metadata + links), not text_sha256. "
                     "Referenced records must already exist."
                 ),
                 "inputSchema": {
@@ -176,10 +179,6 @@ class MCPApplication:
                     "properties": {
                         "type": {"type": "string"},
                         "work_package_id": {"type": "string"},
-                        "created_at": {
-                            "type": "string",
-                            "description": "ISO 8601 datetime with timezone, for example 2026-04-25T10:30:00Z",
-                        },
                         "title": {"type": "string"},
                         "attributes": {"type": "object"},
                         "text": {"type": "string"},
@@ -192,7 +191,6 @@ class MCPApplication:
                     "required": [
                         "type",
                         "work_package_id",
-                        "created_at",
                         "title",
                         "text",
                     ],
