@@ -12,14 +12,15 @@ Records are cached in memory by `work_package_id`. A cached work package stays
 resident for 5 minutes after its last use, and any access to a record in that
 work package refreshes the TTL for the whole package.
 
-Texts are stored as plain JSON files under `data/items/`, so they stay directly grep-able on disk. The item identifier is `sha256(text)`. Existing items are immutable: the same text hash cannot be rewritten with different metadata or links.
+Texts are stored as plain JSON files under `data/items/`, so they stay directly grep-able on disk. The storage key is `sha256(text)` (`text_sha256`). Existing items are immutable: the same text hash cannot be rewritten with different metadata or links.
 
-Each stored item also carries three integrity hashes:
+Each stored item also carries integrity hashes:
 
-- `meta_sha256`: hash of the metadata fields `type`, `work_package_id`, `created_at`, and `title`
 - `meta_sha256`: hash of the metadata fields `type`, `work_package_id`, `created_at`, `title`, and `attributes`
 - `links_sha256`: hash of the validated `links` object
 - `record_sha256`: hash of `text_sha256 + meta_sha256 + links_sha256`
+
+**Links between items reference `record_sha256`, not `text_sha256`.** A link therefore pins the target's exact text *and* metadata *and* links — not just its text content. `text_sha256` is the storage key (used to fetch a record by its content); `record_sha256` is the link id (used to refer to a record from another record). The two are distinct: for any item with non-empty metadata, `text_sha256 != record_sha256`.
 
 ## Schema
 
@@ -49,7 +50,7 @@ Example:
 }
 ```
 
-For every `many` link field, the server also stores a derived `<field>NameHash` value based on the sorted list of referenced hashes. For `evidences`, that becomes `evidencesHash`.
+For every `many` link field, the server also stores a derived `<field>Hash` value based on the sorted list of referenced `record_sha256` values. For `evidences`, that becomes `evidencesHash`.
 
 ## Stored Item Shape
 
@@ -69,9 +70,9 @@ For every `many` link field, the server also stores a derived `<field>NameHash` 
   },
   "text": "....",
   "links": {
-    "prevHypothesisChange": "<hash>",
-    "evidences": ["<hash1>", "<hash2>"],
-    "evidencesHash": "<sha256(sorted evidence hashes)>"
+    "prevHypothesisChange": "<target record_sha256>",
+    "evidences": ["<target record_sha256>", "<target record_sha256>"],
+    "evidencesHash": "<sha256(sorted target record_sha256 values)>"
   },
   "stored_at": "2026-04-25T10:00:00+00:00"
 }
@@ -101,9 +102,9 @@ The MCP server exposes:
 
 `find_tip` returns the most recent item by `created_at` for one exact `work_package_id` and `type`.
 
-`query_chain` starts from one `text_sha256`, walks all referenced items transitively, and returns the full stored records involved in that chain.
+`query_chain` starts from one `text_sha256` (the root), then walks links by `record_sha256` transitively, and returns the full stored records involved in that chain.
 
-`verify_chain` starts from one `text_sha256`, walks all referenced items transitively, and recomputes `text_sha256`, `meta_sha256`, `links_sha256`, and `record_sha256` for each item. It reports whether the whole chain is intact. With `summary=true`, it returns only `ok`, `checked_items`, `errors_count`, and `root_text_sha256`.
+`verify_chain` starts from one `text_sha256` (the root), walks links by `record_sha256` transitively, and recomputes `text_sha256`, `meta_sha256`, `links_sha256`, and `record_sha256` for each item. It reports whether the whole chain is intact. With `summary=true`, it returns only `ok`, `checked_items`, `errors_count`, and `root_text_sha256`.
 
 ## Run
 

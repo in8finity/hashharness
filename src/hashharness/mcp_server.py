@@ -167,7 +167,9 @@ class MCPApplication:
                 "name": "create_item",
                 "description": (
                     "Create an immutable text item. Its identifier is sha256(text). "
-                    "Referenced hashes must already exist."
+                    "Link values are the target items' record_sha256 (full record hash, "
+                    "binding text + metadata + links), not text_sha256. "
+                    "Referenced records must already exist."
                 ),
                 "inputSchema": {
                     "type": "object",

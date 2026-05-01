@@ -57,6 +57,7 @@ class BaseTextStore:
         self.clock = clock or monotonic
         self.work_package_cache: dict[str, CachedWorkPackage] = {}
         self.item_to_work_package: dict[str, str] = {}
+        self.record_to_text_sha256: dict[str, str] = {}
         self.cache_lock = threading.RLock()
         self.write_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.pending_writes: set[str] = set()
@@ -262,35 +263,51 @@ class BaseTextStore:
 
     def verify_chain(self, text_sha256: str) -> dict[str, Any]:
         checked: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen_records: set[str] = set()
 
-        def visit(current_text_sha256: str) -> None:
-            if current_text_sha256 in seen:
-                return
-            seen.add(current_text_sha256)
-
-            try:
-                item = self.get_item(current_text_sha256)
-            except StorageError as exc:
-                checked.append(
+        try:
+            root_item = self.get_item(text_sha256)
+        except StorageError as exc:
+            return {
+                "root_text_sha256": text_sha256,
+                "ok": False,
+                "checked_items": 1,
+                "items": [
                     {
-                        "text_sha256": current_text_sha256,
+                        "text_sha256": text_sha256,
                         "record_sha256": None,
                         "type": None,
                         "ok": False,
                         "errors": [str(exc)],
                         "referenced_hashes": [],
                     }
+                ],
+            }
+
+        def visit(record_sha256: str, item: dict[str, Any] | None = None) -> None:
+            if record_sha256 in seen_records:
+                return
+            seen_records.add(record_sha256)
+            if item is None:
+                item = self._resolve_record_sha256(record_sha256)
+            if item is None:
+                checked.append(
+                    {
+                        "text_sha256": None,
+                        "record_sha256": record_sha256,
+                        "type": None,
+                        "ok": False,
+                        "errors": [f"Item not found for record_sha256={record_sha256}"],
+                        "referenced_hashes": [],
+                    }
                 )
                 return
             item_report = self._verify_item(item)
             checked.append(item_report)
-
             for referenced_hash in item_report["referenced_hashes"]:
-                if referenced_hash not in seen:
-                    visit(referenced_hash)
+                visit(referenced_hash)
 
-        visit(text_sha256)
+        visit(root_item["record_sha256"], root_item)
         ok = all(entry["ok"] for entry in checked)
         return {
             "root_text_sha256": text_sha256,
@@ -301,22 +318,24 @@ class BaseTextStore:
 
     def query_chain(self, text_sha256: str) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen_records: set[str] = set()
+        schema = self.get_schema()
 
-        def visit(current_text_sha256: str) -> None:
-            if current_text_sha256 in seen:
+        def visit(record_sha256: str, item: dict[str, Any] | None = None) -> None:
+            if record_sha256 in seen_records:
                 return
-            seen.add(current_text_sha256)
-
-            item = self.get_item(current_text_sha256)
+            seen_records.add(record_sha256)
+            if item is None:
+                item = self._resolve_record_sha256(record_sha256)
+            if item is None:
+                raise StorageError(f"Item not found for record_sha256={record_sha256}")
             items.append(item)
-
-            schema = self.get_schema()
             rules = self._rules_for_type(schema, item.get("type", ""))
             for referenced_hash in self._extract_reference_hashes(item.get("links", {}), rules):
                 visit(referenced_hash)
 
-        visit(text_sha256)
+        root_item = self.get_item(text_sha256)
+        visit(root_item["record_sha256"], root_item)
         return {
             "root_text_sha256": text_sha256,
             "items": items,
@@ -395,8 +414,11 @@ class BaseTextStore:
             cached = self.work_package_cache.pop(work_package_id, None)
             if not cached:
                 return
-            for text_sha256 in cached.items_by_sha:
+            for text_sha256, item in cached.items_by_sha.items():
                 self.item_to_work_package.pop(text_sha256, None)
+                record_sha256 = item.get("record_sha256")
+                if record_sha256:
+                    self.record_to_text_sha256.pop(record_sha256, None)
 
     def _touch_work_package(self, work_package_id: str) -> None:
         with self.cache_lock:
@@ -421,8 +443,11 @@ class BaseTextStore:
         with self.cache_lock:
             self._drop_work_package_cache(work_package_id)
             self.work_package_cache[work_package_id] = cached
-            for text_sha256 in cached.items_by_sha:
+            for text_sha256, item in cached.items_by_sha.items():
                 self.item_to_work_package[text_sha256] = work_package_id
+                record_sha256 = item.get("record_sha256")
+                if record_sha256:
+                    self.record_to_text_sha256[record_sha256] = text_sha256
         return cached
 
     def _get_cached_item(self, text_sha256: str) -> dict[str, Any] | None:
@@ -442,6 +467,9 @@ class BaseTextStore:
             cached.items_by_sha[item["text_sha256"]] = item
             cached.last_used_at = self.clock()
             self.item_to_work_package[item["text_sha256"]] = work_package_id
+            record_sha256 = item.get("record_sha256")
+            if record_sha256:
+                self.record_to_text_sha256[record_sha256] = item["text_sha256"]
 
     def _enqueue_write(self, item: dict[str, Any]) -> None:
         text_sha256 = item["text_sha256"]
@@ -586,15 +614,38 @@ class BaseTextStore:
 
         return validated
 
-    def _validate_target(self, link_name: str, text_sha256: str, rule: LinkRule) -> None:
-        if not re.fullmatch(r"[0-9a-f]{64}", text_sha256):
-            raise StorageError(f"Link {link_name} contains an invalid sha256: {text_sha256}")
-        target = self.get_item(text_sha256)
+    def _validate_target(self, link_name: str, record_sha256: str, rule: LinkRule) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", record_sha256):
+            raise StorageError(f"Link {link_name} contains an invalid sha256: {record_sha256}")
+        target = self._resolve_record_sha256(record_sha256)
+        if target is None:
+            raise StorageError(
+                f"Link {link_name} target not found for record_sha256={record_sha256}"
+            )
         if target.get("type") not in rule.target_types:
             expected = ", ".join(rule.target_types)
             raise StorageError(
                 f"Link {link_name} expects [{expected}] but got {target.get('type')}"
             )
+
+    def _resolve_record_sha256(self, record_sha256: str) -> dict[str, Any] | None:
+        self._evict_expired_work_packages()
+        with self.cache_lock:
+            text_sha256 = self.record_to_text_sha256.get(record_sha256)
+        if text_sha256:
+            cached = self._get_cached_item(text_sha256)
+            if cached:
+                self._touch_work_package(cached["work_package_id"])
+                return cached
+        for item in self._backend_iter_items():
+            if item.get("record_sha256") == record_sha256:
+                self._get_or_load_work_package_cache(item["work_package_id"])
+                with self.cache_lock:
+                    cached_pkg = self.work_package_cache.get(item["work_package_id"])
+                if cached_pkg:
+                    return cached_pkg.items_by_sha.get(item["text_sha256"], item)
+                return item
+        return None
 
     def _validate_datetime(self, value: str) -> str:
         if not isinstance(value, str):

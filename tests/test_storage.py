@@ -109,15 +109,15 @@ class TextStoreTests(unittest.TestCase):
             work_package_id="wp-1",
             created_at="2026-04-25T11:00:00Z",
             links={
-                "prevHypothesisChange": previous["text_sha256"],
-                "evidences": [evidence_b["text_sha256"], evidence_a["text_sha256"]],
+                "prevHypothesisChange": previous["record_sha256"],
+                "evidences": [evidence_b["record_sha256"], evidence_a["record_sha256"]],
             },
         )
 
-        self.assertEqual(item["links"]["prevHypothesisChange"], previous["text_sha256"])
+        self.assertEqual(item["links"]["prevHypothesisChange"], previous["record_sha256"])
         self.assertEqual(
             item["links"]["evidencesHash"],
-            sha256_joined([evidence_b["text_sha256"], evidence_a["text_sha256"]]),
+            sha256_joined([evidence_b["record_sha256"], evidence_a["record_sha256"]]),
         )
 
     def test_find_items_by_substring(self) -> None:
@@ -174,7 +174,40 @@ class TextStoreTests(unittest.TestCase):
                 title="Bad",
                 work_package_id="wp-1",
                 created_at="2026-04-25T11:00:00Z",
-                links={"prevHypothesisChange": evidence["text_sha256"]},
+                links={"prevHypothesisChange": evidence["record_sha256"]},
+            )
+
+    def test_links_use_record_sha256_not_text_sha256(self) -> None:
+        evidence = self.store.create_item(
+            item_type="Evidence",
+            text="fact",
+            title="Fact",
+            work_package_id="wp-1",
+            created_at="2026-04-25T10:30:00Z",
+        )
+        # Sanity: with non-empty meta, the two ids diverge.
+        self.assertNotEqual(evidence["text_sha256"], evidence["record_sha256"])
+
+        # Linking by record_sha256 succeeds.
+        change = self.store.create_item(
+            item_type="HypothesisChange",
+            text="hypothesis",
+            title="Hyp",
+            work_package_id="wp-1",
+            created_at="2026-04-25T11:00:00Z",
+            links={"evidences": [evidence["record_sha256"]]},
+        )
+        self.assertEqual(change["links"]["evidences"], [evidence["record_sha256"]])
+
+        # Linking by text_sha256 is rejected (target lookup is by record_sha256).
+        with self.assertRaises(StorageError):
+            self.store.create_item(
+                item_type="HypothesisChange",
+                text="hypothesis by text",
+                title="HypByText",
+                work_package_id="wp-1",
+                created_at="2026-04-25T11:01:00Z",
+                links={"evidences": [evidence["text_sha256"]]},
             )
 
     def test_rejects_created_at_without_timezone(self) -> None:
@@ -220,8 +253,8 @@ class TextStoreTests(unittest.TestCase):
             work_package_id="wp-1",
             created_at="2026-04-25T12:00:00Z",
             links={
-                "prevHypothesisChange": previous["text_sha256"],
-                "evidences": [evidence["text_sha256"]],
+                "prevHypothesisChange": previous["record_sha256"],
+                "evidences": [evidence["record_sha256"]],
             },
         )
 
@@ -252,8 +285,8 @@ class TextStoreTests(unittest.TestCase):
             work_package_id="wp-1",
             created_at="2026-04-25T12:00:00Z",
             links={
-                "prevHypothesisChange": previous["text_sha256"],
-                "evidences": [evidence["text_sha256"]],
+                "prevHypothesisChange": previous["record_sha256"],
+                "evidences": [evidence["record_sha256"]],
             },
         )
 
@@ -284,7 +317,7 @@ class TextStoreTests(unittest.TestCase):
             title="Current",
             work_package_id="wp-1",
             created_at="2026-04-25T12:00:00Z",
-            links={"evidences": [evidence["text_sha256"]]},
+            links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.create_item(
             item_type="Evidence",
@@ -318,7 +351,7 @@ class TextStoreTests(unittest.TestCase):
             title="Current",
             work_package_id="wp-1",
             created_at="2026-04-25T12:00:00Z",
-            links={"evidences": [evidence["text_sha256"]]},
+            links={"evidences": [evidence["record_sha256"]]},
         )
 
         result = self.store.get_work_package("wp-1", item_type="Evidence")
@@ -608,7 +641,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        evidence_hash = evidence["result"]["structuredContent"]["text_sha256"]
+        evidence_hash = evidence["result"]["structuredContent"]["record_sha256"]
         current = self._post_json(
             {
                 "jsonrpc": "2.0",
@@ -908,7 +941,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        evidence_hash = evidence["result"]["structuredContent"]["text_sha256"]
+        evidence_hash = evidence["result"]["structuredContent"]["record_sha256"]
         self._post_json(
             {
                 "jsonrpc": "2.0",
@@ -1063,7 +1096,7 @@ class SqliteTextStoreTests(unittest.TestCase):
             title="Hyp",
             work_package_id="wp-9",
             created_at="2026-04-25T10:32:00Z",
-            links={"evidences": [evidence["text_sha256"]]},
+            links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.flush_writes()
 
@@ -1108,7 +1141,7 @@ class SqliteTextStoreTests(unittest.TestCase):
             title="Current",
             work_package_id="wp-1",
             created_at="2026-04-25T12:00:00Z",
-            links={"evidences": [evidence["text_sha256"]]},
+            links={"evidences": [evidence["record_sha256"]]},
         )
         self.store.flush_writes()
 
@@ -1152,7 +1185,7 @@ class MigrateToolTests(unittest.TestCase):
                 title="Hyp",
                 work_package_id="wp-1",
                 created_at="2026-04-25T11:00:00Z",
-                links={"evidences": [evidence["text_sha256"]]},
+                links={"evidences": [evidence["record_sha256"]]},
             )
             fs_store.flush_writes()
 
