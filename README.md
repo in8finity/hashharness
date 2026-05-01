@@ -24,7 +24,7 @@ Each stored item also carries integrity hashes:
 
 ## Schema
 
-The schema is user-defined and typed. It declares which item types exist and which link fields each type may use.
+The schema is user-defined, typed, append-only, and hash-chained. Each call to `set_schema` appends a new version that names its predecessor's `record_sha256`; the current head moves forward by compare-and-swap. Every item carries the `record_sha256` of the schema active when it was written, so `verify_chain` can validate it against the rules in force at write time — even after the schema has changed.
 
 Example:
 
@@ -63,6 +63,40 @@ A link rule may opt in to chain semantics with `"chain_predecessor": true`. Only
 - `find_tip` for chain types returns the head record directly (O(1)) instead of scanning by `created_at`.
 
 This forces append-only-from-tip and rejects concurrent forks. Without this flag, link rules behave like an ordinary single-target reference and offer no fork protection.
+
+### Schema versioning
+
+`set_schema(schema, expected_prev)` performs compare-and-swap on the schema chain head:
+
+- For the **first** (genesis) schema, omit `expected_prev` (or pass `null`).
+- For every subsequent change, `expected_prev` must equal the current head's `record_sha256`. Stale or concurrent updates are rejected with `"schema head moved"`.
+
+Each schema version is stored as:
+
+```json
+{
+  "record_sha256": "<sha256({prev_schema_sha256, payload_sha256, created_at})>",
+  "prev_schema_sha256": "<previous head, or null for genesis>",
+  "payload_sha256": "<sha256(payload)>",
+  "created_at": "<server-stamped>",
+  "payload": { "types": { ... } }
+}
+```
+
+Schema versions are kept under `data/schemas/<record_sha256>.json` (filesystem) or in a `schema_versions` table (sqlite). The current head is in `data/schemas/HEAD` or the `schema_head` table.
+
+Every item gets two extra fields at write time:
+
+- `schema_sha256`: the schema head's `record_sha256` at the moment of writing.
+- `schema_binding_sha256`: `sha256({record_sha256, schema_sha256})` — bakes the binding into a tamper-evident hash that `verify_chain` recomputes.
+
+`record_sha256` itself is unchanged, so existing inter-item links survive a schema bump intact.
+
+`verify_chain` resolves each item's `schema_sha256`, fetches that schema version, and re-validates the item's links against it. A "loosen → write malicious record → tighten" attack leaves a permanent, auditable trace: the malicious record points at the loose schema, and the loose schema is permanently in the chain.
+
+Existing pre-versioning data is migrated lazily on store init: the previously stored single schema becomes the genesis version, and every existing item is stamped with `schema_sha256` + `schema_binding_sha256` pointing at it. `record_sha256` values do not change, so links remain valid.
+
+New MCP tools: `get_schema_history` (full chain) and `get_schema_version(record_sha256)` (one version with metadata). `get_schema` accepts an optional `at` argument to fetch a historical version's payload.
 
 ## Stored Item Shape
 

@@ -18,6 +18,8 @@ ITEM_FIELD_NAMES = {
     "links_sha256",
     "meta_sha256",
     "record_sha256",
+    "schema_binding_sha256",
+    "schema_sha256",
     "text",
     "text_sha256",
     "title",
@@ -76,10 +78,19 @@ class MCPApplication:
         arguments = params.get("arguments", {})
 
         if name == "set_schema":
-            result = self.store.set_schema(arguments["schema"])
+            result = self.store.set_schema(
+                arguments["schema"],
+                expected_prev=arguments.get("expected_prev"),
+            )
             return self._tool_result(result)
         if name == "get_schema":
-            return self._tool_result(self.store.get_schema())
+            return self._tool_result(self.store.get_schema(at=arguments.get("at")))
+        if name == "get_schema_history":
+            return self._tool_result({"versions": self.store.get_schema_history()})
+        if name == "get_schema_version":
+            return self._tool_result(
+                self.store.get_schema_version(arguments["record_sha256"])
+            )
         if name == "create_item":
             if "created_at" in arguments:
                 raise StorageError(
@@ -148,20 +159,68 @@ class MCPApplication:
         return [
             {
                 "name": "set_schema",
-                "description": "Set the schema used to validate item types and link fields.",
+                "description": (
+                    "Append a new schema version. Schemas are append-only and "
+                    "hash-chained. expected_prev must equal the current schema head "
+                    "record_sha256 (or null/omitted for the first/genesis schema); "
+                    "stale expected_prev is rejected with 'schema head moved'."
+                ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"schema": {"type": "object"}},
+                    "properties": {
+                        "schema": {"type": "object"},
+                        "expected_prev": {
+                            "type": ["string", "null"],
+                            "description": "record_sha256 of current head, or null for genesis",
+                        },
+                    },
                     "required": ["schema"],
                     "additionalProperties": False,
                 },
             },
             {
                 "name": "get_schema",
-                "description": "Get the current schema.",
+                "description": (
+                    "Return the schema payload. Without arguments, returns the "
+                    "current head's payload; with `at`, returns the payload of "
+                    "the schema version with that record_sha256."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "at": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "get_schema_history",
+                "description": (
+                    "Return the full schema chain from genesis to current head."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "get_schema_version",
+                "description": (
+                    "Return one schema version (full record) by its record_sha256."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        },
+                    },
+                    "required": ["record_sha256"],
                     "additionalProperties": False,
                 },
             },

@@ -37,15 +37,26 @@ def migrate(
     sqlite_store = SqliteTextStore(dst)
 
     try:
-        schema = fs_store.get_schema()
-        if schema.get("types"):
-            sqlite_store.set_schema(schema)
+        for version in fs_store._backend_iter_schema_versions():
+            sqlite_store._backend_persist_schema_version(version)
+        head = fs_store._backend_get_schema_head()
+        if head is not None:
+            sqlite_store._backend_set_schema_head(head)
 
         item_count = 0
         skipped = 0
         for item in fs_store._backend_iter_items():
             sqlite_store._persist_item(item)
             item_count += 1
+
+        for item in fs_store._backend_iter_items():
+            wp = item.get("work_package_id")
+            item_type = item.get("type")
+            if wp is None or item_type is None:
+                continue
+            stored_head = fs_store._backend_get_head(wp, item_type)
+            if stored_head is not None:
+                sqlite_store._backend_set_head(wp, item_type, stored_head)
 
         # Count corrupt/empty files for reporting.
         for path in fs_store.items_dir.glob("*.json"):

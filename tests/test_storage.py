@@ -713,6 +713,168 @@ class ChainPredecessorTests(unittest.TestCase):
         self.assertIn("at most one", str(ctx.exception))
 
 
+class SchemaVersioningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.wall = AdvancingClock()
+        self.store = TextStore(self.tempdir.name, now_fn=self.wall)
+        self.schema_v1 = {"types": {"Evidence": {"links": {}}}}
+        self.schema_v2 = {
+            "types": {
+                "Evidence": {"links": {}},
+                "Note": {"links": {}},
+            }
+        }
+
+    def tearDown(self) -> None:
+        self.store.flush_writes()
+        self.tempdir.cleanup()
+
+    def test_genesis_schema_chain(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        self.assertIsNone(v1["prev_schema_sha256"])
+        self.assertEqual(self.store.get_schema_head(), v1["record_sha256"])
+
+    def test_set_schema_requires_expected_prev_after_genesis(self) -> None:
+        self.store.set_schema(self.schema_v1)
+        with self.assertRaises(StorageError) as ctx:
+            self.store.set_schema(self.schema_v2)  # missing expected_prev
+        self.assertIn("Schema head moved", str(ctx.exception))
+
+    def test_set_schema_appends_with_correct_expected_prev(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        v2 = self.store.set_schema(self.schema_v2, expected_prev=v1["record_sha256"])
+        self.assertEqual(v2["prev_schema_sha256"], v1["record_sha256"])
+        self.assertEqual(self.store.get_schema_head(), v2["record_sha256"])
+
+    def test_set_schema_rejects_stale_expected_prev(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        self.store.set_schema(self.schema_v2, expected_prev=v1["record_sha256"])
+        with self.assertRaises(StorageError) as ctx:
+            self.store.set_schema(
+                {"types": {"Evidence": {"links": {}}}},
+                expected_prev=v1["record_sha256"],  # stale
+            )
+        self.assertIn("Schema head moved", str(ctx.exception))
+
+    def test_create_item_stamps_current_schema_head(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="t",
+            title="T",
+            work_package_id="wp-1",
+        )
+        self.assertEqual(item["schema_sha256"], v1["record_sha256"])
+        # Binding is sha(record_sha256, schema_sha256).
+        self.assertNotEqual(item["schema_binding_sha256"], item["record_sha256"])
+
+    def test_create_item_requires_schema_to_be_set(self) -> None:
+        with self.assertRaises(StorageError) as ctx:
+            self.store.create_item(
+                item_type="Evidence",
+                text="t",
+                title="T",
+                work_package_id="wp-1",
+            )
+        self.assertIn("No schema set", str(ctx.exception))
+
+    def test_item_validates_against_schema_at_write_time(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="t",
+            title="T",
+            work_package_id="wp-1",
+        )
+        # Bump schema; item still binds to v1 and verify_chain still passes.
+        self.store.set_schema(self.schema_v2, expected_prev=v1["record_sha256"])
+        report = self.store.verify_chain(item["text_sha256"])
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["items"][0]["schema_sha256"], v1["record_sha256"])
+
+    def test_verify_chain_detects_schema_binding_tampering(self) -> None:
+        self.store.set_schema(self.schema_v1)
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="t",
+            title="T",
+            work_package_id="wp-1",
+        )
+        self.store.flush_writes()
+        path = self.store.items_dir / f"{item['text_sha256']}.json"
+        tampered = json.loads(path.read_text(encoding="utf-8"))
+        tampered["schema_binding_sha256"] = "0" * 64
+        path.write_text(json.dumps(tampered, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # Force a fresh read from disk; cache otherwise hides the tamper.
+        self.store._drop_work_package_cache("wp-1")
+
+        report = self.store.verify_chain(item["text_sha256"])
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("schema_binding_sha256" in err for err in report["items"][0]["errors"])
+        )
+
+    def test_get_schema_history_returns_chain_in_order(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        v2 = self.store.set_schema(self.schema_v2, expected_prev=v1["record_sha256"])
+        history = self.store.get_schema_history()
+        self.assertEqual(
+            [v["record_sha256"] for v in history],
+            [v1["record_sha256"], v2["record_sha256"]],
+        )
+
+    def test_get_schema_at_historical_sha(self) -> None:
+        v1 = self.store.set_schema(self.schema_v1)
+        self.store.set_schema(self.schema_v2, expected_prev=v1["record_sha256"])
+        # Current head returns v2.
+        self.assertIn("Note", self.store.get_schema()["types"])
+        # Historical lookup returns v1.
+        historical = self.store.get_schema(at=v1["record_sha256"])
+        self.assertNotIn("Note", historical["types"])
+
+    def test_legacy_data_is_migrated_to_genesis(self) -> None:
+        # Simulate a pre-versioning store by writing the legacy schema.json
+        # and an item directly to disk, then re-opening.
+        with TemporaryDirectory() as legacy_root:
+            legacy_root_path = Path(legacy_root)
+            (legacy_root_path / "items").mkdir(parents=True, exist_ok=True)
+            (legacy_root_path / "schema.json").write_text(
+                json.dumps({"types": {"Evidence": {"links": {}}}}),
+                encoding="utf-8",
+            )
+            legacy_item = {
+                "type": "Evidence",
+                "text_sha256": sha256_text("legacy"),
+                "meta_sha256": "deadbeef" * 8,
+                "links_sha256": "cafef00d" * 8,
+                "record_sha256": "abcd1234" * 8,
+                "work_package_id": "wp-1",
+                "created_at": "2026-04-25T10:00:00+00:00",
+                "title": "Legacy",
+                "attributes": {},
+                "text": "legacy",
+                "links": {},
+            }
+            (legacy_root_path / "items" / f"{legacy_item['text_sha256']}.json").write_text(
+                json.dumps(legacy_item, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            store = TextStore(legacy_root_path, now_fn=AdvancingClock())
+            try:
+                head = store.get_schema_head()
+                self.assertIsNotNone(head)
+                # schema.json is gone after migration; HEAD file took its place.
+                self.assertFalse((legacy_root_path / "schema.json").exists())
+                # Item was stamped with schema_sha256 + schema_binding_sha256.
+                fetched = store.get_item(legacy_item["text_sha256"])
+                self.assertEqual(fetched["schema_sha256"], head)
+                self.assertIn("schema_binding_sha256", fetched)
+            finally:
+                store.flush_writes()
+
+
 class HttpMCPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()

@@ -77,11 +77,28 @@ class BaseTextStore:
     def _init_backend(self) -> None:
         raise NotImplementedError
 
-    def _backend_get_schema(self) -> dict[str, Any] | None:
+    def _backend_get_schema_head(self) -> str | None:
         raise NotImplementedError
 
-    def _backend_set_schema(self, schema: dict[str, Any]) -> None:
+    def _backend_set_schema_head(self, record_sha256: str) -> None:
         raise NotImplementedError
+
+    def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def _backend_persist_schema_version(self, version: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def _backend_iter_schema_versions(self) -> Iterator[dict[str, Any]]:
+        raise NotImplementedError
+
+    def _backend_legacy_schema_payload(self) -> dict[str, Any] | None:
+        """Return any pre-versioning schema payload, for one-shot migration."""
+        return None
+
+    def _backend_clear_legacy_schema(self) -> None:
+        """Drop the pre-versioning schema after migration."""
+        return None
 
     def _backend_read_item(self, text_sha256: str) -> dict[str, Any] | None:
         raise NotImplementedError
@@ -106,16 +123,149 @@ class BaseTextStore:
         raise NotImplementedError
 
     # ------------------------------------------------------------------- public
-    def get_schema(self) -> dict[str, Any]:
-        schema = self._backend_get_schema()
-        if schema is None:
+    def get_schema(self, *, at: str | None = None) -> dict[str, Any]:
+        if at is not None:
+            version = self._backend_read_schema_version(at)
+            if version is None:
+                raise StorageError(f"Schema version not found: {at}")
+            return version["payload"]
+        head = self._backend_get_schema_head()
+        if head is None:
             return {"types": {}}
-        return schema
+        version = self._backend_read_schema_version(head)
+        if version is None:
+            raise StorageError(f"Schema head points at missing version: {head}")
+        return version["payload"]
 
-    def set_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+    def get_schema_head(self) -> str | None:
+        return self._backend_get_schema_head()
+
+    def get_schema_version(self, record_sha256: str) -> dict[str, Any]:
+        version = self._backend_read_schema_version(record_sha256)
+        if version is None:
+            raise StorageError(f"Schema version not found: {record_sha256}")
+        return version
+
+    def get_schema_history(self) -> list[dict[str, Any]]:
+        history: list[dict[str, Any]] = []
+        head = self._backend_get_schema_head()
+        seen: set[str] = set()
+        while head is not None:
+            if head in seen:
+                raise StorageError(f"Cycle detected in schema chain at {head}")
+            seen.add(head)
+            version = self._backend_read_schema_version(head)
+            if version is None:
+                raise StorageError(f"Schema chain broken at {head}")
+            history.append(version)
+            head = version.get("prev_schema_sha256")
+        return list(reversed(history))
+
+    def set_schema(
+        self,
+        schema: dict[str, Any],
+        *,
+        expected_prev: str | None = None,
+    ) -> dict[str, Any]:
         self._validate_schema_definition(schema)
-        self._backend_set_schema(schema)
-        return schema
+        with self.cache_lock:
+            current_head = self._backend_get_schema_head()
+            if current_head != expected_prev:
+                raise StorageError(
+                    f"Schema head moved: expected_prev={expected_prev}, "
+                    f"current={current_head}"
+                )
+            payload_sha = sha256_json(schema)
+            created_at = self._validate_datetime(self.now_fn().isoformat())
+            record_sha = self._schema_record_sha256(
+                prev_schema_sha256=expected_prev,
+                payload_sha256=payload_sha,
+                created_at=created_at,
+            )
+            version = {
+                "record_sha256": record_sha,
+                "prev_schema_sha256": expected_prev,
+                "payload_sha256": payload_sha,
+                "created_at": created_at,
+                "payload": schema,
+            }
+            self._backend_persist_schema_version(version)
+            self._backend_set_schema_head(record_sha)
+        return version
+
+    def _migrate_legacy_schema_if_needed(self) -> None:
+        """One-shot migration from pre-versioning schema storage.
+
+        If the chain head already exists, no-op. Otherwise, look for a legacy
+        single-payload schema; if present, wrap it as a genesis schema version
+        and stamp every existing item with schema_sha256 + schema_binding_sha256.
+        """
+        if self._backend_get_schema_head() is not None:
+            return
+        legacy = self._backend_legacy_schema_payload()
+        if legacy is None:
+            return
+        try:
+            self._validate_schema_definition(legacy)
+        except StorageError:
+            return  # leave malformed legacy data alone
+
+        payload_sha = sha256_json(legacy)
+        created_at = self._validate_datetime(self.now_fn().isoformat())
+        record_sha = self._schema_record_sha256(
+            prev_schema_sha256=None,
+            payload_sha256=payload_sha,
+            created_at=created_at,
+        )
+        version = {
+            "record_sha256": record_sha,
+            "prev_schema_sha256": None,
+            "payload_sha256": payload_sha,
+            "created_at": created_at,
+            "payload": legacy,
+        }
+        self._backend_persist_schema_version(version)
+        self._backend_set_schema_head(record_sha)
+
+        for item in list(self._backend_iter_items()):
+            if "schema_sha256" in item and "schema_binding_sha256" in item:
+                continue
+            item["schema_sha256"] = record_sha
+            item["schema_binding_sha256"] = self._schema_binding_sha256(
+                record_sha256=item.get("record_sha256", ""),
+                schema_sha256=record_sha,
+            )
+            self._persist_item(item)
+
+        self._backend_clear_legacy_schema()
+
+    def _schema_record_sha256(
+        self,
+        *,
+        prev_schema_sha256: str | None,
+        payload_sha256: str,
+        created_at: str,
+    ) -> str:
+        return sha256_json(
+            {
+                "created_at": created_at,
+                "payload_sha256": payload_sha256,
+                "prev_schema_sha256": prev_schema_sha256,
+            }
+        )
+
+    def _schema_binding_sha256(
+        self,
+        *,
+        record_sha256: str,
+        schema_sha256: str,
+    ) -> str:
+        return sha256_json(
+            {
+                "record_sha256": record_sha256,
+                "schema_sha256": schema_sha256,
+            }
+        )
 
     def get_item(self, text_sha256: str) -> dict[str, Any]:
         self._evict_expired_work_packages()
@@ -142,6 +292,9 @@ class BaseTextStore:
         attributes: dict[str, Any] | None = None,
         links: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        schema_head = self._backend_get_schema_head()
+        if schema_head is None:
+            raise StorageError("No schema set; call set_schema before create_item")
         schema = self.get_schema()
         rules = self._rules_for_type(schema, item_type)
         text_hash = sha256_text(text)
@@ -157,16 +310,23 @@ class BaseTextStore:
             attributes=validated_attributes,
         )
         links_sha256 = sha256_json(validated_links)
+        record_sha = self._record_sha256(
+            text_sha256=text_hash,
+            meta_sha256=meta_sha256,
+            links_sha256=links_sha256,
+        )
+        binding_sha = self._schema_binding_sha256(
+            record_sha256=record_sha,
+            schema_sha256=schema_head,
+        )
         item = {
             "type": item_type,
             "text_sha256": text_hash,
             "meta_sha256": meta_sha256,
             "links_sha256": links_sha256,
-            "record_sha256": self._record_sha256(
-                text_sha256=text_hash,
-                meta_sha256=meta_sha256,
-                links_sha256=links_sha256,
-            ),
+            "record_sha256": record_sha,
+            "schema_sha256": schema_head,
+            "schema_binding_sha256": binding_sha,
             "work_package_id": work_package_id,
             "created_at": normalized_created_at,
             "title": title,
@@ -296,6 +456,7 @@ class BaseTextStore:
                     {
                         "text_sha256": text_sha256,
                         "record_sha256": None,
+                        "schema_sha256": None,
                         "type": None,
                         "ok": False,
                         "errors": [str(exc)],
@@ -315,6 +476,7 @@ class BaseTextStore:
                     {
                         "text_sha256": None,
                         "record_sha256": record_sha256,
+                        "schema_sha256": None,
                         "type": None,
                         "ok": False,
                         "errors": [f"Item not found for record_sha256={record_sha256}"],
@@ -856,8 +1018,31 @@ class BaseTextStore:
         if item.get("meta_sha256") != expected_meta_sha256:
             errors.append("meta_sha256 does not match item metadata")
 
+        # Resolve the schema this item was bound to at write time. If absent,
+        # fall back to the current schema (legacy / pre-versioning item).
+        schema_sha = item.get("schema_sha256")
+        if schema_sha is not None:
+            schema_version = self._backend_read_schema_version(schema_sha)
+            if schema_version is None:
+                errors.append(f"schema_sha256 references missing version: {schema_sha}")
+                schema_payload = self.get_schema()
+            else:
+                schema_payload = schema_version["payload"]
+                expected_payload_sha = sha256_json(schema_payload)
+                if schema_version.get("payload_sha256") != expected_payload_sha:
+                    errors.append("schema version payload_sha256 does not match payload")
+                expected_schema_record_sha = self._schema_record_sha256(
+                    prev_schema_sha256=schema_version.get("prev_schema_sha256"),
+                    payload_sha256=expected_payload_sha,
+                    created_at=schema_version.get("created_at", ""),
+                )
+                if schema_version.get("record_sha256") != expected_schema_record_sha:
+                    errors.append("schema version record_sha256 does not match its inputs")
+        else:
+            schema_payload = self.get_schema()
+
         try:
-            rules = self._rules_for_type(self.get_schema(), item.get("type", ""))
+            rules = self._rules_for_type(schema_payload, item.get("type", ""))
             raw_links = {
                 name: item.get("links", {}).get(name)
                 for name in rules
@@ -884,9 +1069,20 @@ class BaseTextStore:
         if item.get("record_sha256") != expected_record_sha256:
             errors.append("record_sha256 does not match text/meta/links hashes")
 
+        if schema_sha is not None:
+            expected_binding = self._schema_binding_sha256(
+                record_sha256=expected_record_sha256,
+                schema_sha256=schema_sha,
+            )
+            if item.get("schema_binding_sha256") != expected_binding:
+                errors.append(
+                    "schema_binding_sha256 does not match record_sha256 + schema_sha256"
+                )
+
         return {
             "text_sha256": item.get("text_sha256"),
             "record_sha256": item.get("record_sha256"),
+            "schema_sha256": schema_sha,
             "type": item.get("type"),
             "ok": not errors,
             "errors": errors,
@@ -936,23 +1132,61 @@ class FilesystemTextStore(BaseTextStore):
         self.items_dir = self.root / "items"
         self.schema_path = self.root / "schema.json"
         self.heads_path = self.root / "heads.json"
+        self.schemas_dir = self.root / "schemas"
+        self.schema_head_path = self.schemas_dir / "HEAD"
         self.heads_lock = threading.RLock()
+        self.schemas_lock = threading.RLock()
         super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
+        self._migrate_legacy_schema_if_needed()
 
     def _init_backend(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.items_dir.mkdir(parents=True, exist_ok=True)
+        self.schemas_dir.mkdir(parents=True, exist_ok=True)
 
-    def _backend_get_schema(self) -> dict[str, Any] | None:
+    def _backend_legacy_schema_payload(self) -> dict[str, Any] | None:
         if not self.schema_path.exists():
             return None
         return json.loads(self.schema_path.read_text(encoding="utf-8"))
 
-    def _backend_set_schema(self, schema: dict[str, Any]) -> None:
-        self.schema_path.write_text(
-            json.dumps(schema, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+    def _backend_clear_legacy_schema(self) -> None:
+        if self.schema_path.exists():
+            self.schema_path.unlink()
+
+    def _backend_get_schema_head(self) -> str | None:
+        with self.schemas_lock:
+            if not self.schema_head_path.exists():
+                return None
+            head = self.schema_head_path.read_text(encoding="utf-8").strip()
+        return head or None
+
+    def _backend_set_schema_head(self, record_sha256: str) -> None:
+        with self.schemas_lock:
+            tmp_path = self.schema_head_path.with_name(
+                f".HEAD.{threading.get_ident()}.tmp"
+            )
+            tmp_path.write_text(record_sha256, encoding="utf-8")
+            tmp_path.replace(self.schema_head_path)
+
+    def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
+        path = self.schemas_dir / f"{record_sha256}.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _backend_persist_schema_version(self, version: dict[str, Any]) -> None:
+        path = self.schemas_dir / f"{version['record_sha256']}.json"
+        with self.schemas_lock:
+            tmp_path = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+            tmp_path.write_text(
+                json.dumps(version, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+
+    def _backend_iter_schema_versions(self) -> Iterator[dict[str, Any]]:
+        for path in sorted(self.schemas_dir.glob("*.json")):
+            yield json.loads(path.read_text(encoding="utf-8"))
 
     def _backend_read_item(self, text_sha256: str) -> dict[str, Any] | None:
         path = self.items_dir / f"{text_sha256}.json"
@@ -1060,6 +1294,7 @@ class SqliteTextStore(BaseTextStore):
         self.db_lock = threading.RLock()
         self.conn: sqlite3.Connection | None = None
         super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
+        self._migrate_legacy_schema_if_needed()
 
     def _init_backend(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1096,6 +1331,18 @@ class SqliteTextStore(BaseTextStore):
                 "PRIMARY KEY (work_package_id, item_type)"
                 ")"
             )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_versions ("
+                "record_sha256 TEXT PRIMARY KEY, "
+                "payload TEXT NOT NULL"
+                ")"
+            )
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_head ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "record_sha256 TEXT NOT NULL"
+                ")"
+            )
 
     def close(self) -> None:
         with self.db_lock:
@@ -1103,7 +1350,7 @@ class SqliteTextStore(BaseTextStore):
                 self.conn.close()
                 self.conn = None
 
-    def _backend_get_schema(self) -> dict[str, Any] | None:
+    def _backend_legacy_schema_payload(self) -> dict[str, Any] | None:
         with self.db_lock:
             row = self.conn.execute(
                 "SELECT payload FROM schema_kv WHERE id = 1"
@@ -1112,14 +1359,52 @@ class SqliteTextStore(BaseTextStore):
             return None
         return json.loads(row[0])
 
-    def _backend_set_schema(self, schema: dict[str, Any]) -> None:
-        payload = json.dumps(schema, sort_keys=True, ensure_ascii=False)
+    def _backend_clear_legacy_schema(self) -> None:
+        with self.db_lock:
+            self.conn.execute("DELETE FROM schema_kv WHERE id = 1")
+
+    def _backend_get_schema_head(self) -> str | None:
+        with self.db_lock:
+            row = self.conn.execute(
+                "SELECT record_sha256 FROM schema_head WHERE id = 1"
+            ).fetchone()
+        return row[0] if row else None
+
+    def _backend_set_schema_head(self, record_sha256: str) -> None:
         with self.db_lock:
             self.conn.execute(
-                "INSERT INTO schema_kv (id, payload) VALUES (1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
-                (payload,),
+                "INSERT INTO schema_head (id, record_sha256) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET record_sha256 = excluded.record_sha256",
+                (record_sha256,),
             )
+
+    def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
+        with self.db_lock:
+            row = self.conn.execute(
+                "SELECT payload FROM schema_versions WHERE record_sha256 = ?",
+                (record_sha256,),
+            ).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0])
+
+    def _backend_persist_schema_version(self, version: dict[str, Any]) -> None:
+        payload = json.dumps(version, sort_keys=True, ensure_ascii=False)
+        with self.db_lock:
+            self.conn.execute(
+                "INSERT INTO schema_versions (record_sha256, payload) "
+                "VALUES (?, ?) "
+                "ON CONFLICT(record_sha256) DO UPDATE SET payload = excluded.payload",
+                (version["record_sha256"], payload),
+            )
+
+    def _backend_iter_schema_versions(self) -> Iterator[dict[str, Any]]:
+        with self.db_lock:
+            rows = self.conn.execute(
+                "SELECT payload FROM schema_versions ORDER BY record_sha256"
+            ).fetchall()
+        for (payload,) in rows:
+            yield json.loads(payload)
 
     def _backend_read_item(self, text_sha256: str) -> dict[str, Any] | None:
         with self.db_lock:
