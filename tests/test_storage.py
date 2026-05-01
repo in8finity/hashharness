@@ -982,6 +982,41 @@ class HttpMCPServerTests(unittest.TestCase):
             {"source": "lab"},
         )
 
+    def test_http_transport_create_item_rejects_caller_supplied_created_at(self) -> None:
+        self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_schema",
+                    "arguments": {"schema": {"types": {"Evidence": {"links": {}}}}},
+                },
+            },
+        )
+
+        response = self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_item",
+                    "arguments": {
+                        "type": "Evidence",
+                        "work_package_id": "wp-1",
+                        "title": "Backdate Attempt",
+                        "text": "claimed-old-evidence",
+                        "created_at": "2020-01-01T00:00:00+00:00",
+                    },
+                },
+            },
+        )
+
+        result = response["result"]
+        self.assertTrue(result.get("isError"), result)
+        self.assertIn("server-stamped", result["content"][0]["text"])
+
     def test_http_transport_create_item_defaults_to_minimal_return(self) -> None:
         self._post_json(
             {
