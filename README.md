@@ -29,6 +29,8 @@ These are what `verify_chain` checks. If verification passes, all of them hold f
 
 What's **not** invariant (open gaps): writes are unauthenticated (anyone reaching the protocol can write to any `work_package_id`), `set_schema` itself is unauthenticated, and there are no resource caps. See the security roadmap for ranked mitigations.
 
+These invariants sit between "claim in a README" and "formally verified end-to-end." They are encoded in formal models — Alloy 6 for the full protocol (8/8 safety assertions pass within bounded scope; adversarial runs produce counterexamples confirming each defense is causally necessary, not vacuously true) and Dafny 4 for unbounded proofs of I1 and I3 — and the `system-model/reports/` audit cross-references each modeled invariant against the production code gate and the test that exercises it (12/12 enforced). What this does *not* mean: the models, the code, the audit reports, and the mapping between them were all produced with substantial LLM assistance. The Alloy assertions were machine-checked by the Alloy Analyzer; the Dafny methods were machine-checked by Dafny; everything else (model faithfulness to the real protocol, code-to-model correspondence, test adequacy) rests on human + LLM review, not a verified compiler chain. Treat the models as a much stronger audit artifact than prose, and a much weaker one than seL4-style end-to-end proof. See [`system-model/`](system-model/README.md) for details.
+
 ## Stored item shape
 
 ```json
@@ -117,6 +119,7 @@ Pre-versioning data is migrated lazily on store init: the previously stored sing
 | `get_item_by_hash` | Fetch one record by `text_sha256`. |
 | `get_work_package` | Return every record in one `work_package_id`, optionally filtered by `type`. |
 | `find_tip` | Return the chain head for `(work_package_id, item_type)`. For chain types, O(1) head lookup; otherwise picks max-`created_at` (legacy fallback). |
+| `find_tips_bulk` | Batched form of `find_tip`: one `(type, [work_package_ids])` call returns a dict keyed by `work_package_id`, with missing chains mapped to `null`. Up to 10000 ids per call. Sqlite backend uses a two-query fast path (heads + items via `IN`); filesystem backend loops `find_tip`. Intended for dashboards / summary views over many chains. |
 | `query_chain` | Walk from a root `text_sha256`, following `record_sha256` links transitively; return all records in the chain. |
 | `verify_chain` | Recompute every hash for every record reachable from a root `text_sha256`. Reports per-item `ok`/`errors`. With `summary=true`, returns only `ok`, `checked_items`, `errors_count`, `root_text_sha256`. |
 
