@@ -137,6 +137,23 @@ class MCPApplication:
             )
             fields = arguments.get("fields", ["type", "title", "text_sha256", "record_sha256", "created_at"])
             return self._tool_result(self._project_item(result, fields))
+        if name == "find_tips_bulk":
+            ids = arguments["work_package_ids"]
+            if not isinstance(ids, list):
+                raise StorageError("work_package_ids must be a list")
+            if len(ids) > 10000:
+                raise StorageError("work_package_ids exceeds maximum of 10000 per call")
+            tips = self.store.find_tips_bulk(ids, arguments["type"])
+            fields = arguments.get("fields")
+            projected: dict[str, dict[str, Any] | None] = {}
+            for wp_id, item in tips.items():
+                if item is None:
+                    projected[wp_id] = None
+                elif fields is None:
+                    projected[wp_id] = item
+                else:
+                    projected[wp_id] = self._project_item(item, fields)
+            return self._tool_result({"tips": projected})
         if name == "query_chain":
             result = self.store.query_chain(arguments["text_sha256"])
             return self._tool_result(result)
@@ -332,6 +349,33 @@ class MCPApplication:
                         },
                     },
                     "required": ["work_package_id", "type"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "find_tips_bulk",
+                "description": (
+                    "Return the tip item for each given work_package_id and item type "
+                    "in a single call. Result is a dict keyed by work_package_id; "
+                    "missing chains map to null (no error). Up to 10000 ids per call. "
+                    "Use this instead of N find_tip calls when rendering dashboards or "
+                    "summary views over many chains."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "work_package_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 10000,
+                        },
+                        "type": {"type": "string"},
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["work_package_ids", "type"],
                     "additionalProperties": False,
                 },
             },

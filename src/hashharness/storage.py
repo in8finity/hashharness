@@ -33,6 +33,11 @@ class CachedWorkPackage:
     last_used_at: float
 
 
+def _chunked(values: list[str], size: int) -> Iterator[list[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -541,6 +546,19 @@ class BaseTextStore:
             "items": items,
             "item_count": len(items),
         }
+
+    def find_tips_bulk(
+        self, work_package_ids: list[str], item_type: str
+    ) -> dict[str, dict[str, Any] | None]:
+        result: dict[str, dict[str, Any] | None] = {}
+        for work_package_id in work_package_ids:
+            if work_package_id in result:
+                continue
+            try:
+                result[work_package_id] = self.find_tip(work_package_id, item_type)
+            except StorageError:
+                result[work_package_id] = None
+        return result
 
     def find_tip(self, work_package_id: str, item_type: str) -> dict[str, Any]:
         rule = self._chain_predecessor_rule_for_type(item_type)
@@ -1472,6 +1490,88 @@ class SqliteTextStore(BaseTextStore):
                 "  record_sha256 = excluded.record_sha256",
                 (work_package_id, item_type, record_sha256),
             )
+
+    def find_tips_bulk(
+        self, work_package_ids: list[str], item_type: str
+    ) -> dict[str, dict[str, Any] | None]:
+        if not work_package_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(work_package_ids))
+        rule = self._chain_predecessor_rule_for_type(item_type)
+
+        if rule is not None:
+            heads: dict[str, str] = {}
+            for chunk in _chunked(unique_ids, 500):
+                placeholders = ",".join("?" * len(chunk))
+                with self.db_lock:
+                    rows = self.conn.execute(
+                        f"SELECT work_package_id, record_sha256 FROM heads "
+                        f"WHERE item_type = ? AND work_package_id IN ({placeholders})",
+                        (item_type, *chunk),
+                    ).fetchall()
+                for wp_id, record_sha256 in rows:
+                    heads[wp_id] = record_sha256
+
+            wps_with_heads = list(heads.keys())
+            record_to_item: dict[str, dict[str, Any]] = {}
+            target_records = set(heads.values())
+            for chunk in _chunked(wps_with_heads, 500):
+                placeholders = ",".join("?" * len(chunk))
+                with self.db_lock:
+                    rows = self.conn.execute(
+                        f"SELECT text_sha256, payload FROM items "
+                        f"WHERE work_package_id IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                for text_sha256, payload in rows:
+                    item = self._decode_payload(payload, context=text_sha256, strict=False)
+                    if item is None:
+                        continue
+                    record_sha256 = item.get("record_sha256")
+                    if record_sha256 in target_records and item.get("type") == item_type:
+                        record_to_item[record_sha256] = item
+
+            result: dict[str, dict[str, Any] | None] = {}
+            for wp_id in unique_ids:
+                record_sha256 = heads.get(wp_id)
+                if record_sha256 is None:
+                    result[wp_id] = None
+                    continue
+                item = record_to_item.get(record_sha256)
+                if item is None:
+                    raise StorageError(
+                        f"Head record not found for work_package_id={wp_id} "
+                        f"and type={item_type}: {record_sha256}"
+                    )
+                result[wp_id] = item
+            return result
+
+        by_wp: dict[str, dict[str, Any]] = {}
+        for chunk in _chunked(unique_ids, 500):
+            placeholders = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows = self.conn.execute(
+                    f"SELECT text_sha256, payload FROM items "
+                    f"WHERE work_package_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            for text_sha256, payload in rows:
+                item = self._decode_payload(payload, context=text_sha256, strict=False)
+                if item is None or item.get("type") != item_type:
+                    continue
+                wp_id = item["work_package_id"]
+                existing = by_wp.get(wp_id)
+                if existing is None:
+                    by_wp[wp_id] = item
+                    continue
+                new_key = (datetime.fromisoformat(item["created_at"]), item["text_sha256"])
+                existing_key = (
+                    datetime.fromisoformat(existing["created_at"]),
+                    existing["text_sha256"],
+                )
+                if new_key > existing_key:
+                    by_wp[wp_id] = item
+        return {wp_id: by_wp.get(wp_id) for wp_id in unique_ids}
 
     def _decode_payload(
         self, payload: str, *, context: str, strict: bool = True

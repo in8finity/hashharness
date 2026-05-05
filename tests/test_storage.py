@@ -405,6 +405,44 @@ class TextStoreTests(unittest.TestCase):
         self.assertEqual(result["text_sha256"], latest["text_sha256"])
         self.assertEqual(result["title"], "Latest")
 
+    def test_find_tips_bulk_returns_tip_per_id_and_null_for_missing(self) -> None:
+        wp1_latest = self.store.create_item(
+            item_type="Evidence",
+            text="wp1 first",
+            title="wp1-first",
+            work_package_id="wp-1",
+        )
+        wp1_latest = self.store.create_item(
+            item_type="Evidence",
+            text="wp1 second",
+            title="wp1-second",
+            work_package_id="wp-1",
+        )
+        wp2_only = self.store.create_item(
+            item_type="Evidence",
+            text="wp2 only",
+            title="wp2-only",
+            work_package_id="wp-2",
+        )
+        self.store.create_item(
+            item_type="HypothesisChange",
+            text="wp1 hypothesis",
+            title="wp1-hyp",
+            work_package_id="wp-1",
+        )
+        self.store.flush_writes()
+
+        result = self.store.find_tips_bulk(
+            ["wp-1", "wp-2", "wp-missing", "wp-1"],
+            "Evidence",
+        )
+
+        self.assertEqual(set(result.keys()), {"wp-1", "wp-2", "wp-missing"})
+        self.assertEqual(result["wp-1"]["title"], "wp1-second")
+        self.assertEqual(result["wp-1"]["text_sha256"], wp1_latest["text_sha256"])
+        self.assertEqual(result["wp-2"]["text_sha256"], wp2_only["text_sha256"])
+        self.assertIsNone(result["wp-missing"])
+
     def test_find_items_ignores_empty_orphan_files(self) -> None:
         self.store.create_item(
             item_type="Evidence",
@@ -898,6 +936,7 @@ class HttpMCPServerTests(unittest.TestCase):
         self.assertIn("query_chain", {tool["name"] for tool in tools["result"]["tools"]})
         self.assertIn("get_work_package", {tool["name"] for tool in tools["result"]["tools"]})
         self.assertIn("find_tip", {tool["name"] for tool in tools["result"]["tools"]})
+        self.assertIn("find_tips_bulk", {tool["name"] for tool in tools["result"]["tools"]})
 
     def test_http_transport_runs_tool_calls(self) -> None:
         schema = {
@@ -1231,6 +1270,84 @@ class HttpMCPServerTests(unittest.TestCase):
             {"created_at", "record_sha256", "text_sha256", "title", "type"},
         )
 
+    def test_http_transport_find_tips_bulk_returns_dict_with_nulls(self) -> None:
+        schema = {"types": {"Evidence": {"links": {}}}}
+        self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "set_schema", "arguments": {"schema": schema}},
+            },
+        )
+        for wp_id, title in [("wp-a", "A1"), ("wp-a", "A2"), ("wp-b", "B1")]:
+            self._post_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "create_item",
+                        "arguments": {
+                            "type": "Evidence",
+                            "work_package_id": wp_id,
+                            "title": title,
+                            "text": title,
+                            "return": "full",
+                        },
+                    },
+                },
+            )
+
+        result = self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_tips_bulk",
+                    "arguments": {
+                        "work_package_ids": ["wp-a", "wp-b", "wp-missing"],
+                        "type": "Evidence",
+                        "fields": ["title", "text_sha256"],
+                    },
+                },
+            },
+        )
+
+        tips = result["result"]["structuredContent"]["tips"]
+        self.assertEqual(tips["wp-a"]["title"], "A2")
+        self.assertEqual(tips["wp-b"]["title"], "B1")
+        self.assertIsNone(tips["wp-missing"])
+        self.assertEqual(set(tips["wp-a"].keys()), {"title", "text_sha256"})
+
+    def test_http_transport_find_tips_bulk_rejects_oversize_input(self) -> None:
+        schema = {"types": {"Evidence": {"links": {}}}}
+        self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "set_schema", "arguments": {"schema": schema}},
+            },
+        )
+        result = self._post_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_tips_bulk",
+                    "arguments": {
+                        "work_package_ids": [f"wp-{i}" for i in range(10001)],
+                        "type": "Evidence",
+                    },
+                },
+            },
+        )
+        self.assertTrue(result["result"].get("isError"))
+        self.assertIn("10000", result["result"]["content"][0]["text"])
+
     def test_http_transport_gets_work_package(self) -> None:
         schema = {
             "types": {
@@ -1450,6 +1567,86 @@ class SqliteTextStoreTests(unittest.TestCase):
                 title="Different",
                 work_package_id="wp-2",
             )
+
+    def test_find_tips_bulk_non_chain_type(self) -> None:
+        self.store.create_item(
+            item_type="Evidence",
+            text="wp1 first",
+            title="wp1-first",
+            work_package_id="wp-1",
+        )
+        wp1_latest = self.store.create_item(
+            item_type="Evidence",
+            text="wp1 second",
+            title="wp1-second",
+            work_package_id="wp-1",
+        )
+        wp2_only = self.store.create_item(
+            item_type="Evidence",
+            text="wp2 only",
+            title="wp2-only",
+            work_package_id="wp-2",
+        )
+        self.store.flush_writes()
+
+        result = self.store.find_tips_bulk(
+            ["wp-1", "wp-2", "wp-missing"], "Evidence"
+        )
+
+        self.assertEqual(result["wp-1"]["text_sha256"], wp1_latest["text_sha256"])
+        self.assertEqual(result["wp-2"]["text_sha256"], wp2_only["text_sha256"])
+        self.assertIsNone(result["wp-missing"])
+
+    def test_find_tips_bulk_chain_type_uses_head_pointer(self) -> None:
+        c1_a = self.store.create_item(
+            item_type="HypothesisChange",
+            text="wp-a c1",
+            title="A1",
+            work_package_id="wp-a",
+        )
+        c2_a = self.store.create_item(
+            item_type="HypothesisChange",
+            text="wp-a c2",
+            title="A2",
+            work_package_id="wp-a",
+            links={"prevHypothesisChange": c1_a["record_sha256"]},
+        )
+        c1_b = self.store.create_item(
+            item_type="HypothesisChange",
+            text="wp-b c1",
+            title="B1",
+            work_package_id="wp-b",
+        )
+        self.store.flush_writes()
+
+        result = self.store.find_tips_bulk(
+            ["wp-a", "wp-b", "wp-empty"], "HypothesisChange"
+        )
+
+        self.assertEqual(result["wp-a"]["record_sha256"], c2_a["record_sha256"])
+        self.assertEqual(result["wp-b"]["record_sha256"], c1_b["record_sha256"])
+        self.assertIsNone(result["wp-empty"])
+
+    def test_find_tips_bulk_empty_input(self) -> None:
+        self.assertEqual(self.store.find_tips_bulk([], "Evidence"), {})
+
+    def test_find_tips_bulk_chunks_large_input(self) -> None:
+        wp_ids = [f"wp-{i:04d}" for i in range(750)]
+        for wp_id in wp_ids:
+            self.store.create_item(
+                item_type="Evidence",
+                text=f"evidence for {wp_id}",
+                title=wp_id,
+                work_package_id=wp_id,
+            )
+        self.store.flush_writes()
+
+        result = self.store.find_tips_bulk(wp_ids + ["wp-missing"], "Evidence")
+
+        self.assertEqual(len(result), len(wp_ids) + 1)
+        self.assertIsNone(result["wp-missing"])
+        self.assertEqual(result["wp-0000"]["title"], "wp-0000")
+        self.assertEqual(result["wp-0749"]["title"], "wp-0749")
 
     def test_verify_chain_round_trip(self) -> None:
         evidence = self.store.create_item(
