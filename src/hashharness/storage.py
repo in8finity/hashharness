@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import queue
@@ -85,7 +86,9 @@ class BaseTextStore:
     def _backend_get_schema_head(self) -> str | None:
         raise NotImplementedError
 
-    def _backend_set_schema_head(self, record_sha256: str) -> None:
+    def _backend_set_schema_head(
+        self, record_sha256: str, *, expected_prev: str | None
+    ) -> None:
         raise NotImplementedError
 
     def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
@@ -123,7 +126,12 @@ class BaseTextStore:
         raise NotImplementedError
 
     def _backend_set_head(
-        self, work_package_id: str, item_type: str, record_sha256: str
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        *,
+        expected_prev: str | None,
     ) -> None:
         raise NotImplementedError
 
@@ -195,7 +203,7 @@ class BaseTextStore:
                 "payload": schema,
             }
             self._backend_persist_schema_version(version)
-            self._backend_set_schema_head(record_sha)
+            self._backend_set_schema_head(record_sha, expected_prev=expected_prev)
         return version
 
     def _migrate_legacy_schema_if_needed(self) -> None:
@@ -230,7 +238,10 @@ class BaseTextStore:
             "payload": legacy,
         }
         self._backend_persist_schema_version(version)
-        self._backend_set_schema_head(record_sha)
+        try:
+            self._backend_set_schema_head(record_sha, expected_prev=None)
+        except StorageError:
+            return  # another process already migrated; their head wins.
 
         for item in list(self._backend_iter_items()):
             if "schema_sha256" in item and "schema_binding_sha256" in item:
@@ -300,7 +311,11 @@ class BaseTextStore:
         schema_head = self._backend_get_schema_head()
         if schema_head is None:
             raise StorageError("No schema set; call set_schema before create_item")
-        schema = self.get_schema()
+        # Pin schema to the head we just read. A concurrent set_schema must
+        # not be allowed to slip in between rule lookup and stamping —
+        # otherwise links get validated against S1 but the item is stamped
+        # with S0, breaking every hash invariant at verify time.
+        schema = self.get_schema(at=schema_head)
         rules = self._rules_for_type(schema, item_type)
         text_hash = sha256_text(text)
 
@@ -378,7 +393,13 @@ class BaseTextStore:
             self._enqueue_write(item)
 
             if predecessor_rule is not None:
-                self._set_head(work_package_id, item_type, item["record_sha256"])
+                supplied_prev = validated_links.get(predecessor_rule.name)
+                self._set_head(
+                    work_package_id,
+                    item_type,
+                    item["record_sha256"],
+                    expected_prev=supplied_prev,
+                )
 
             return item
 
@@ -782,7 +803,14 @@ class BaseTextStore:
         if item_type not in types:
             raise StorageError(f"Type {item_type} is not defined in schema")
         raw_links = types[item_type].get("links", {})
-        return {name: self._parse_rule(name, rule) for name, rule in raw_links.items()}
+        rules = {name: self._parse_rule(name, rule) for name, rule in raw_links.items()}
+        chain_predecessor_count = sum(1 for rule in rules.values() if rule.chain_predecessor)
+        if chain_predecessor_count > 1:
+            raise StorageError(
+                f"Type {item_type} declares {chain_predecessor_count} "
+                "chain_predecessor links; at most one is allowed"
+            )
+        return rules
 
     def _parse_rule(self, name: str, rule: dict[str, Any]) -> LinkRule:
         if not isinstance(rule, dict):
@@ -898,11 +926,21 @@ class BaseTextStore:
         return self._bootstrap_head(work_package_id, item_type)
 
     def _set_head(
-        self, work_package_id: str, item_type: str, record_sha256: str
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        *,
+        expected_prev: str | None,
     ) -> None:
+        # Persist with cross-process CAS BEFORE updating the in-memory cache,
+        # so a losing race leaves the cache untouched (and re-reads will refresh
+        # against the winner's head).
+        self._backend_set_head(
+            work_package_id, item_type, record_sha256, expected_prev=expected_prev
+        )
         with self.cache_lock:
             self.heads[(work_package_id, item_type)] = record_sha256
-        self._backend_set_head(work_package_id, item_type, record_sha256)
 
     def _bootstrap_head(self, work_package_id: str, item_type: str) -> str | None:
         rule = self._chain_predecessor_rule_for_type(item_type)
@@ -935,7 +973,13 @@ class BaseTextStore:
                 f"{len(tips)} unreferenced tips; manual reconciliation required"
             )
         head = tips[0]["record_sha256"]
-        self._set_head(work_package_id, item_type, head)
+        # Bootstrap recovery: head was None until now. If another instance
+        # bootstrapped concurrently, swallow the CAS loss — they wrote
+        # equivalent state.
+        try:
+            self._set_head(work_package_id, item_type, head, expected_prev=None)
+        except StorageError:
+            pass
         return head
 
     def _validate_target(self, link_name: str, record_sha256: str, rule: LinkRule) -> None:
@@ -1056,6 +1100,23 @@ class BaseTextStore:
                 )
                 if schema_version.get("record_sha256") != expected_schema_record_sha:
                     errors.append("schema version record_sha256 does not match its inputs")
+                # Internal self-consistency is necessary but not sufficient:
+                # the schema must also be reachable from current head via
+                # prev_schema_sha256 walks. Otherwise an attacker can persist
+                # a self-consistent off-chain schema and bind records to it.
+                try:
+                    canonical = {
+                        version["record_sha256"]
+                        for version in self.get_schema_history()
+                    }
+                except StorageError as exc:
+                    errors.append(f"schema chain history unavailable: {exc}")
+                    canonical = set()
+                if schema_sha not in canonical:
+                    errors.append(
+                        f"schema_sha256 {schema_sha} is not in the canonical "
+                        "schema chain"
+                    )
         else:
             schema_payload = self.get_schema()
 
@@ -1178,13 +1239,36 @@ class FilesystemTextStore(BaseTextStore):
             head = self.schema_head_path.read_text(encoding="utf-8").strip()
         return head or None
 
-    def _backend_set_schema_head(self, record_sha256: str) -> None:
+    def _backend_set_schema_head(
+        self, record_sha256: str, *, expected_prev: str | None
+    ) -> None:
+        # Cross-process CAS: use fcntl.flock on a sibling lock file so two
+        # processes (or two store instances) cannot both pass the head-equals-
+        # expected check and then both write. The in-process schemas_lock
+        # alone is insufficient — it does not span processes or instances.
+        self.schemas_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.schemas_dir / "HEAD.lock"
         with self.schemas_lock:
-            tmp_path = self.schema_head_path.with_name(
-                f".HEAD.{threading.get_ident()}.tmp"
-            )
-            tmp_path.write_text(record_sha256, encoding="utf-8")
-            tmp_path.replace(self.schema_head_path)
+            with open(lock_path, "a+") as lockf:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                try:
+                    current: str | None = None
+                    if self.schema_head_path.exists():
+                        current = self.schema_head_path.read_text(
+                            encoding="utf-8"
+                        ).strip() or None
+                    if current != expected_prev:
+                        raise StorageError(
+                            f"Schema head moved: expected_prev={expected_prev}, "
+                            f"current={current}"
+                        )
+                    tmp_path = self.schema_head_path.with_name(
+                        f".HEAD.{threading.get_ident()}.tmp"
+                    )
+                    tmp_path.write_text(record_sha256, encoding="utf-8")
+                    tmp_path.replace(self.schema_head_path)
+                finally:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
     def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
         path = self.schemas_dir / f"{record_sha256}.json"
@@ -1250,19 +1334,40 @@ class FilesystemTextStore(BaseTextStore):
         return heads.get(self._heads_key(work_package_id, item_type))
 
     def _backend_set_head(
-        self, work_package_id: str, item_type: str, record_sha256: str
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        *,
+        expected_prev: str | None,
     ) -> None:
+        # Cross-process CAS via fcntl.flock on a sibling lock file.
+        self.heads_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.heads_path.with_suffix(self.heads_path.suffix + ".lock")
+        key = self._heads_key(work_package_id, item_type)
         with self.heads_lock:
-            heads = self._read_heads_file()
-            heads[self._heads_key(work_package_id, item_type)] = record_sha256
-            tmp_path = self.heads_path.with_name(
-                f".{self.heads_path.name}.{threading.get_ident()}.tmp"
-            )
-            tmp_path.write_text(
-                json.dumps(heads, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            tmp_path.replace(self.heads_path)
+            with open(lock_path, "a+") as lockf:
+                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                try:
+                    heads = self._read_heads_file()
+                    current = heads.get(key)
+                    if current != expected_prev:
+                        raise StorageError(
+                            f"Chain head moved for {item_type} in "
+                            f"work_package_id={work_package_id}: expected "
+                            f"{expected_prev}, current={current}"
+                        )
+                    heads[key] = record_sha256
+                    tmp_path = self.heads_path.with_name(
+                        f".{self.heads_path.name}.{threading.get_ident()}.tmp"
+                    )
+                    tmp_path.write_text(
+                        json.dumps(heads, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    tmp_path.replace(self.heads_path)
+                finally:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
     def _persist_item_to_disk(self, item_path: Path, item: dict[str, Any]) -> None:
         tmp_path = item_path.with_name(f".{item_path.name}.{threading.get_ident()}.tmp")
@@ -1388,13 +1493,39 @@ class SqliteTextStore(BaseTextStore):
             ).fetchone()
         return row[0] if row else None
 
-    def _backend_set_schema_head(self, record_sha256: str) -> None:
+    def _backend_set_schema_head(
+        self, record_sha256: str, *, expected_prev: str | None
+    ) -> None:
         with self.db_lock:
-            self.conn.execute(
-                "INSERT INTO schema_head (id, record_sha256) VALUES (1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET record_sha256 = excluded.record_sha256",
-                (record_sha256,),
-            )
+            if expected_prev is None:
+                cur = self.conn.execute(
+                    "INSERT INTO schema_head (id, record_sha256) VALUES (1, ?) "
+                    "ON CONFLICT(id) DO NOTHING",
+                    (record_sha256,),
+                )
+                if cur.rowcount != 1:
+                    row = self.conn.execute(
+                        "SELECT record_sha256 FROM schema_head WHERE id = 1"
+                    ).fetchone()
+                    current = row[0] if row else None
+                    raise StorageError(
+                        f"Schema head moved: expected_prev=None, current={current}"
+                    )
+            else:
+                cur = self.conn.execute(
+                    "UPDATE schema_head SET record_sha256 = ? "
+                    "WHERE id = 1 AND record_sha256 = ?",
+                    (record_sha256, expected_prev),
+                )
+                if cur.rowcount != 1:
+                    row = self.conn.execute(
+                        "SELECT record_sha256 FROM schema_head WHERE id = 1"
+                    ).fetchone()
+                    current = row[0] if row else None
+                    raise StorageError(
+                        f"Schema head moved: expected_prev={expected_prev}, "
+                        f"current={current}"
+                    )
 
     def _backend_read_schema_version(self, record_sha256: str) -> dict[str, Any] | None:
         with self.db_lock:
@@ -1480,16 +1611,52 @@ class SqliteTextStore(BaseTextStore):
         return row[0] if row else None
 
     def _backend_set_head(
-        self, work_package_id: str, item_type: str, record_sha256: str
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        *,
+        expected_prev: str | None,
     ) -> None:
         with self.db_lock:
-            self.conn.execute(
-                "INSERT INTO heads (work_package_id, item_type, record_sha256) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(work_package_id, item_type) DO UPDATE SET "
-                "  record_sha256 = excluded.record_sha256",
-                (work_package_id, item_type, record_sha256),
-            )
+            if expected_prev is None:
+                cur = self.conn.execute(
+                    "INSERT INTO heads (work_package_id, item_type, record_sha256) "
+                    "VALUES (?, ?, ?) ON CONFLICT(work_package_id, item_type) "
+                    "DO NOTHING",
+                    (work_package_id, item_type, record_sha256),
+                )
+                if cur.rowcount != 1:
+                    row = self.conn.execute(
+                        "SELECT record_sha256 FROM heads "
+                        "WHERE work_package_id = ? AND item_type = ?",
+                        (work_package_id, item_type),
+                    ).fetchone()
+                    current = row[0] if row else None
+                    raise StorageError(
+                        f"Chain head moved for {item_type} in "
+                        f"work_package_id={work_package_id}: expected None, "
+                        f"current={current}"
+                    )
+            else:
+                cur = self.conn.execute(
+                    "UPDATE heads SET record_sha256 = ? "
+                    "WHERE work_package_id = ? AND item_type = ? "
+                    "AND record_sha256 = ?",
+                    (record_sha256, work_package_id, item_type, expected_prev),
+                )
+                if cur.rowcount != 1:
+                    row = self.conn.execute(
+                        "SELECT record_sha256 FROM heads "
+                        "WHERE work_package_id = ? AND item_type = ?",
+                        (work_package_id, item_type),
+                    ).fetchone()
+                    current = row[0] if row else None
+                    raise StorageError(
+                        f"Chain head moved for {item_type} in "
+                        f"work_package_id={work_package_id}: expected "
+                        f"{expected_prev}, current={current}"
+                    )
 
     def find_tips_bulk(
         self, work_package_ids: list[str], item_type: str

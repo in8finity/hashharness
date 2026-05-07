@@ -750,6 +750,55 @@ class ChainPredecessorTests(unittest.TestCase):
             )
         self.assertIn("at most one", str(ctx.exception))
 
+    def test_create_item_rejects_persisted_schema_with_two_chain_predecessors(self) -> None:
+        from hashharness.storage import sha256_json
+
+        malformed = {
+            "types": {
+                "X": {
+                    "links": {
+                        "prevA": {
+                            "kind": "single",
+                            "target_types": ["X"],
+                            "chain_predecessor": True,
+                        },
+                        "prevB": {
+                            "kind": "single",
+                            "target_types": ["X"],
+                            "chain_predecessor": True,
+                        },
+                    }
+                }
+            }
+        }
+        payload_sha = sha256_json(malformed)
+        created_at = "2026-05-07T00:00:00+00:00"
+        prev_head = self.store._backend_get_schema_head()
+        record_sha = self.store._schema_record_sha256(
+            prev_schema_sha256=prev_head,
+            payload_sha256=payload_sha,
+            created_at=created_at,
+        )
+        self.store._backend_persist_schema_version(
+            {
+                "record_sha256": record_sha,
+                "prev_schema_sha256": prev_head,
+                "payload_sha256": payload_sha,
+                "created_at": created_at,
+                "payload": malformed,
+            }
+        )
+        self.store._backend_set_schema_head(record_sha, expected_prev=prev_head)
+
+        with self.assertRaises(StorageError) as ctx:
+            self.store.create_item(
+                item_type="X",
+                text="first",
+                title="a",
+                work_package_id="wp-1",
+            )
+        self.assertIn("at most one", str(ctx.exception))
+
 
 class SchemaVersioningTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1669,6 +1718,410 @@ class SqliteTextStoreTests(unittest.TestCase):
         self.assertEqual(report["checked_items"], 2)
 
 
+class SchemaCASRaceTests(unittest.TestCase):
+    """Cross-instance / cross-process CAS protection for set_schema."""
+
+    def _race(self, store_factory, db_arg):
+        # Bootstrap a genesis schema via a third store instance.
+        boot = store_factory(db_arg)
+        v0 = boot.set_schema({"types": {"A": {"links": {}}}})
+        head0 = v0["record_sha256"]
+        boot.flush_writes()
+        if hasattr(boot, "close"):
+            boot.close()
+
+        s1 = store_factory(db_arg)
+        s2 = store_factory(db_arg)
+
+        # Force the interleave: both reads complete before either write.
+        both_have_read = threading.Barrier(2)
+        s1_done = threading.Event()
+        orig_get_s1 = s1._backend_get_schema_head
+        orig_get_s2 = s2._backend_get_schema_head
+
+        def s1_get():
+            h = orig_get_s1()
+            both_have_read.wait(timeout=5)
+            return h
+
+        def s2_get():
+            h = orig_get_s2()
+            both_have_read.wait(timeout=5)
+            s1_done.wait(timeout=5)
+            return h
+
+        s1._backend_get_schema_head = s1_get
+        s2._backend_get_schema_head = s2_get
+
+        out: dict = {}
+
+        def go(label, store, schema):
+            try:
+                out[label] = store.set_schema(schema, expected_prev=head0)
+            except StorageError as exc:
+                out[label] = exc
+            if label == "s1":
+                s1_done.set()
+
+        t1 = threading.Thread(
+            target=go,
+            args=("s1", s1, {"types": {"A": {"links": {}}, "B": {"links": {}}}}),
+        )
+        t2 = threading.Thread(
+            target=go,
+            args=("s2", s2, {"types": {"A": {"links": {}}, "C": {"links": {}}}}),
+        )
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        s1.flush_writes()
+        s2.flush_writes()
+        if hasattr(s1, "close"):
+            s1.close()
+        if hasattr(s2, "close"):
+            s2.close()
+
+        return out
+
+    def _assert_one_winner(self, out, store) -> None:
+        successes = [v for v in out.values() if not isinstance(v, StorageError)]
+        failures = [v for v in out.values() if isinstance(v, StorageError)]
+        self.assertEqual(len(successes), 1, msg=f"both succeeded: {out}")
+        self.assertEqual(len(failures), 1, msg=f"both failed: {out}")
+        self.assertIn("Schema head moved", str(failures[0]))
+        # Head points at the winner.
+        self.assertEqual(
+            store._backend_get_schema_head(),
+            successes[0]["record_sha256"],
+        )
+        # Walk-back from head is linear (no fork on the active chain).
+        history = store.get_schema_history()
+        seen_prevs: set[str | None] = set()
+        for version in history:
+            prev = version["prev_schema_sha256"]
+            self.assertNotIn(prev, seen_prevs)
+            seen_prevs.add(prev)
+
+    def test_sqlite_set_schema_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            out = self._race(SqliteTextStore, db)
+            verifier = SqliteTextStore(db)
+            try:
+                self._assert_one_winner(out, verifier)
+            finally:
+                verifier.close()
+
+    def test_filesystem_set_schema_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            out = self._race(lambda root: TextStore(root, now_fn=AdvancingClock()), td)
+            verifier = TextStore(td)
+            self._assert_one_winner(out, verifier)
+
+
+class ItemChainCASRaceTests(unittest.TestCase):
+    """Cross-instance / cross-process CAS protection for chain_predecessor heads (I4b)."""
+
+    SCHEMA = {
+        "types": {
+            "X": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["X"],
+                        "chain_predecessor": True,
+                    }
+                }
+            }
+        }
+    }
+
+    def _race(self, store_factory, db_arg):
+        boot = store_factory(db_arg)
+        boot.set_schema(self.SCHEMA)
+        first = boot.create_item(
+            item_type="X", text="genesis", title="g", work_package_id="wp-1"
+        )
+        head0 = first["record_sha256"]
+        boot.flush_writes()
+        if hasattr(boot, "close"):
+            boot.close()
+
+        s1 = store_factory(db_arg)
+        s2 = store_factory(db_arg)
+        # Drop per-instance head caches so the patched _backend_get_head fires.
+        s1.heads.clear()
+        s2.heads.clear()
+
+        barrier = threading.Barrier(2)
+        s1_done = threading.Event()
+        orig1, orig2 = s1._backend_get_head, s2._backend_get_head
+
+        def g1(*a, **k):
+            h = orig1(*a, **k)
+            barrier.wait(timeout=5)
+            return h
+
+        def g2(*a, **k):
+            h = orig2(*a, **k)
+            barrier.wait(timeout=5)
+            s1_done.wait(timeout=5)
+            return h
+
+        s1._backend_get_head = g1
+        s2._backend_get_head = g2
+
+        out: dict = {}
+
+        def go(label, store, text):
+            try:
+                out[label] = store.create_item(
+                    item_type="X",
+                    text=text,
+                    title=label,
+                    work_package_id="wp-1",
+                    links={"prev": head0},
+                )
+            except StorageError as exc:
+                out[label] = exc
+            if label == "s1":
+                s1_done.set()
+
+        t1 = threading.Thread(target=go, args=("s1", s1, "fork-A"))
+        t2 = threading.Thread(target=go, args=("s2", s2, "fork-B"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        s1.flush_writes()
+        s2.flush_writes()
+        if hasattr(s1, "close"):
+            s1.close()
+        if hasattr(s2, "close"):
+            s2.close()
+        return out, head0
+
+    def _assert_one_winner(self, out, head0, store) -> None:
+        successes = [v for v in out.values() if not isinstance(v, StorageError)]
+        failures = [v for v in out.values() if isinstance(v, StorageError)]
+        self.assertEqual(len(successes), 1, msg=f"both succeeded: {out}")
+        self.assertEqual(len(failures), 1, msg=f"both failed: {out}")
+        self.assertIn("Chain head moved", str(failures[0]))
+        self.assertEqual(
+            store._backend_get_head("wp-1", "X"),
+            successes[0]["record_sha256"],
+        )
+
+    def test_sqlite_create_item_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            out, head0 = self._race(SqliteTextStore, db)
+            verifier = SqliteTextStore(db)
+            try:
+                self._assert_one_winner(out, head0, verifier)
+            finally:
+                verifier.close()
+
+    def test_filesystem_create_item_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            out, head0 = self._race(
+                lambda root: TextStore(root, now_fn=AdvancingClock()), td
+            )
+            verifier = TextStore(td)
+            self._assert_one_winner(out, head0, verifier)
+
+
+class SchemaPinningTests(unittest.TestCase):
+    """I5c: create_item must validate against the same schema version it stamps."""
+
+    def test_create_item_pins_schema_across_concurrent_set_schema(self) -> None:
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            boot = SqliteTextStore(db)
+            v0 = boot.set_schema(
+                {
+                    "types": {
+                        "X": {
+                            "links": {
+                                "a": {"kind": "single", "target_types": ["X"]}
+                            }
+                        }
+                    }
+                }
+            )
+            head0 = v0["record_sha256"]
+            target = boot.create_item(
+                item_type="X", text="target", title="t", work_package_id="wp-1"
+            )
+            boot.flush_writes()
+            boot.close()
+
+            writer = SqliteTextStore(db)
+            caller = SqliteTextStore(db)
+
+            # Force a concurrent set_schema to land between the caller's two
+            # schema reads in create_item.
+            orig_get_head = caller._backend_get_schema_head
+            call_no = {"n": 0}
+
+            def patched():
+                call_no["n"] += 1
+                h = orig_get_head()
+                if call_no["n"] == 1:
+                    writer.set_schema(
+                        {
+                            "types": {
+                                "X": {
+                                    "links": {
+                                        "b": {
+                                            "kind": "single",
+                                            "target_types": ["X"],
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        expected_prev=head0,
+                    )
+                return h
+
+            caller._backend_get_schema_head = patched
+
+            # Old schema (S0) only knows link 'a'. With the fix, the caller
+            # pins to S0; supplying link 'b' must be rejected as unknown.
+            with self.assertRaises(StorageError) as ctx:
+                caller.create_item(
+                    item_type="X",
+                    text="racy",
+                    title="racy",
+                    work_package_id="wp-1",
+                    links={"b": target["record_sha256"]},
+                )
+            self.assertIn("Unknown link fields: b", str(ctx.exception))
+
+            writer.flush_writes()
+            caller.flush_writes()
+            writer.close()
+            caller.close()
+
+
+class SchemaChainReachabilityTests(unittest.TestCase):
+    """I5d: verify_chain rejects records bound to off-chain schema versions."""
+
+    def test_verify_rejects_off_chain_schema_binding(self) -> None:
+        from hashharness.storage import sha256_json, sha256_text
+
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            store = SqliteTextStore(db)
+            store.set_schema(
+                {
+                    "types": {
+                        "X": {
+                            "links": {
+                                "a": {"kind": "single", "target_types": ["X"]}
+                            }
+                        }
+                    }
+                }
+            )
+            target = store.create_item(
+                item_type="X", text="target", title="t", work_package_id="wp-1"
+            )
+
+            # Forge an off-chain schema version: self-consistent (correct
+            # payload_sha256 + record_sha256), but its prev_schema_sha256
+            # points at nothing reachable from the canonical head.
+            rogue_payload = {
+                "types": {
+                    "X": {
+                        "links": {
+                            "a": {"kind": "single", "target_types": ["X"]},
+                            "evil": {"kind": "single", "target_types": ["X"]},
+                        }
+                    }
+                }
+            }
+            rogue_payload_sha = sha256_json(rogue_payload)
+            rogue_record_sha = store._schema_record_sha256(
+                prev_schema_sha256="00" * 32,
+                payload_sha256=rogue_payload_sha,
+                created_at="2099-01-01T00:00:00+00:00",
+            )
+            store._backend_persist_schema_version(
+                {
+                    "record_sha256": rogue_record_sha,
+                    "prev_schema_sha256": "00" * 32,
+                    "payload_sha256": rogue_payload_sha,
+                    "created_at": "2099-01-01T00:00:00+00:00",
+                    "payload": rogue_payload,
+                }
+            )
+
+            # Persist a record bound to the off-chain schema, using the link
+            # only the rogue schema knows about. All hashes computed honestly.
+            text = "rogue-record"
+            text_hash = sha256_text(text)
+            created_at = "2099-01-01T00:00:01+00:00"
+            meta_sha = store._meta_sha256(
+                item_type="X",
+                work_package_id="wp-1",
+                created_at=created_at,
+                title="r",
+                attributes={},
+            )
+            links = {"evil": target["record_sha256"]}
+            links_sha = sha256_json(links)
+            record_sha = store._record_sha256(
+                text_sha256=text_hash,
+                meta_sha256=meta_sha,
+                links_sha256=links_sha,
+            )
+            binding = store._schema_binding_sha256(
+                record_sha256=record_sha, schema_sha256=rogue_record_sha
+            )
+            store._persist_item(
+                {
+                    "type": "X",
+                    "text_sha256": text_hash,
+                    "meta_sha256": meta_sha,
+                    "links_sha256": links_sha,
+                    "record_sha256": record_sha,
+                    "schema_sha256": rogue_record_sha,
+                    "schema_binding_sha256": binding,
+                    "work_package_id": "wp-1",
+                    "created_at": created_at,
+                    "title": "r",
+                    "attributes": {},
+                    "text": text,
+                    "links": links,
+                }
+            )
+            store.flush_writes()
+            store.close()
+
+            verifier = SqliteTextStore(db)
+            try:
+                rep = verifier.verify_chain(text_hash)
+                self.assertFalse(rep["ok"])
+                # Find the rogue record's report and check the message.
+                rogue_report = next(
+                    r for r in rep["items"] if r["record_sha256"] == record_sha
+                )
+                self.assertTrue(
+                    any(
+                        "not in the canonical schema chain" in msg
+                        for msg in rogue_report["errors"]
+                    ),
+                    msg=f"errors: {rogue_report['errors']}",
+                )
+            finally:
+                verifier.close()
+
+
 class MigrateToolTests(unittest.TestCase):
     def test_migrate_filesystem_to_sqlite(self) -> None:
         from hashharness.migrate import migrate
@@ -1726,6 +2179,54 @@ class MigrateToolTests(unittest.TestCase):
             finally:
                 sqlite_store.flush_writes()
                 sqlite_store.close()
+
+    def test_migrate_rejects_malformed_source_schema(self) -> None:
+        from hashharness.migrate import migrate
+        from hashharness.storage import sha256_json
+
+        with TemporaryDirectory() as src_dir, TemporaryDirectory() as dst_dir:
+            fs_store = TextStore(src_dir, now_fn=AdvancingClock())
+            malformed = {
+                "types": {
+                    "X": {
+                        "links": {
+                            "prevA": {
+                                "kind": "single",
+                                "target_types": ["X"],
+                                "chain_predecessor": True,
+                            },
+                            "prevB": {
+                                "kind": "single",
+                                "target_types": ["X"],
+                                "chain_predecessor": True,
+                            },
+                        }
+                    }
+                }
+            }
+            payload_sha = sha256_json(malformed)
+            created_at = "2026-05-07T00:00:00+00:00"
+            record_sha = fs_store._schema_record_sha256(
+                prev_schema_sha256=None,
+                payload_sha256=payload_sha,
+                created_at=created_at,
+            )
+            fs_store._backend_persist_schema_version(
+                {
+                    "record_sha256": record_sha,
+                    "prev_schema_sha256": None,
+                    "payload_sha256": payload_sha,
+                    "created_at": created_at,
+                    "payload": malformed,
+                }
+            )
+            fs_store._backend_set_schema_head(record_sha, expected_prev=None)
+            fs_store.flush_writes()
+
+            db_path = Path(dst_dir) / "out.sqlite"
+            with self.assertRaises(StorageError) as ctx:
+                migrate(Path(src_dir), db_path)
+            self.assertIn("at most one", str(ctx.exception))
 
     def test_migrate_refuses_existing_destination(self) -> None:
         from hashharness.migrate import migrate

@@ -38,10 +38,11 @@ def migrate(
 
     try:
         for version in fs_store._backend_iter_schema_versions():
+            sqlite_store._validate_schema_definition(version["payload"])
             sqlite_store._backend_persist_schema_version(version)
         head = fs_store._backend_get_schema_head()
         if head is not None:
-            sqlite_store._backend_set_schema_head(head)
+            sqlite_store._backend_set_schema_head(head, expected_prev=None)
 
         item_count = 0
         skipped = 0
@@ -56,7 +57,9 @@ def migrate(
                 continue
             stored_head = fs_store._backend_get_head(wp, item_type)
             if stored_head is not None:
-                sqlite_store._backend_set_head(wp, item_type, stored_head)
+                sqlite_store._backend_set_head(
+                    wp, item_type, stored_head, expected_prev=None
+                )
 
         # Count corrupt/empty files for reporting.
         for path in fs_store.items_dir.glob("*.json"):
