@@ -1330,17 +1330,20 @@ class FilesystemTextStore(BaseTextStore):
 
     def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
         item_path = self.items_dir / f"{item['text_sha256']}.json"
-        # O_EXCL gives atomic create-if-not-exists at the FS layer; this is
-        # the cross-process equivalent of SQLite's UNIQUE-constraint insert.
+        # tmp + os.link gives atomic create-if-not-exists at the FS layer
+        # (link(2) raises EEXIST if the target exists), without the
+        # empty-file window an O_EXCL+write sequence would leave for
+        # concurrent readers.
+        import os as _os
         payload = json.dumps(item, indent=2, sort_keys=True) + "\n"
+        tmp_path = self.items_dir / (
+            f".{item_path.name}.{threading.get_ident()}.{_os.getpid()}.tmp"
+        )
+        tmp_path.write_text(payload, encoding="utf-8")
         try:
-            import os as _os
-            fd = _os.open(
-                str(item_path),
-                _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
-                0o644,
-            )
+            _os.link(str(tmp_path), str(item_path))
         except FileExistsError:
+            tmp_path.unlink()
             existing = self._read_item_file(item_path, strict=True)
             if existing is None or not self._same_item(existing, item):
                 raise StorageError(
@@ -1348,15 +1351,11 @@ class FilesystemTextStore(BaseTextStore):
                     "cannot be updated"
                 )
             return
-        try:
-            with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload)
-        except Exception:
+        finally:
             try:
-                item_path.unlink()
+                tmp_path.unlink()
             except FileNotFoundError:
                 pass
-            raise
 
     def _heads_key(self, work_package_id: str, item_type: str) -> str:
         return f"{work_package_id}\x00{item_type}"
