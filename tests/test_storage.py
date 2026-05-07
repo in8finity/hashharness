@@ -554,46 +554,24 @@ class TextStoreTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["checked_items"], 1)
 
-    def test_create_item_returns_before_background_flush(self) -> None:
-        class SlowPersistStore(TextStore):
-            def __init__(self, *args: object, persist_gate: threading.Event, **kwargs: object) -> None:
-                self.persist_gate = persist_gate
-                super().__init__(*args, **kwargs)
-
-            def _persist_item_to_disk(self, item_path: object, item: dict[str, object]) -> None:
-                self.persist_gate.wait(timeout=5)
-                super()._persist_item_to_disk(item_path, item)
-
+    def test_create_item_persists_synchronously(self) -> None:
+        # I1 cross-process enforcement requires the duplicate check + insert
+        # to be atomic at the storage layer. The previous "returns before
+        # background flush" optimization left a window where two instances
+        # could both pass the duplicate check and both write — a silent
+        # last-writer-wins. The new contract: by the time create_item
+        # returns, the row is durable.
         with TemporaryDirectory() as tempdir:
-            gate = threading.Event()
-            slow_store = SlowPersistStore(
-                tempdir,
-                clock=lambda: self.now,
-                persist_gate=gate,
-            )
-            slow_store.set_schema(
-                {
-                    "types": {
-                        "Evidence": {"links": {}},
-                    }
-                }
-            )
-            item = slow_store.create_item(
+            store = TextStore(tempdir, clock=lambda: self.now)
+            store.set_schema({"types": {"Evidence": {"links": {}}}})
+            item = store.create_item(
                 item_type="Evidence",
-                text="background write",
-                title="Background Write",
+                text="sync write",
+                title="Sync Write",
                 work_package_id="wp-1",
             )
-            item_path = slow_store.items_dir / f"{item['text_sha256']}.json"
-
-            self.assertFalse(item_path.exists())
-            self.assertEqual(slow_store.get_item(item["text_sha256"])["title"], "Background Write")
-
-            gate.set()
-            slow_store.flush_writes()
+            item_path = store.items_dir / f"{item['text_sha256']}.json"
             self.assertTrue(item_path.exists())
-            tmp_files = list(slow_store.items_dir.glob(f".{item_path.name}.*.tmp"))
-            self.assertEqual(tmp_files, [])
 
 
 class ChainPredecessorTests(unittest.TestCase):
@@ -2120,6 +2098,93 @@ class SchemaChainReachabilityTests(unittest.TestCase):
                 )
             finally:
                 verifier.close()
+
+
+class TextHashUniqueRaceTests(unittest.TestCase):
+    """I1: text_sha256 unique-and-immutable, even under cross-instance races."""
+
+    def _race(self, store_factory, db_arg):
+        boot = store_factory(db_arg)
+        boot.set_schema(
+            {"types": {"X": {"links": {}}, "Y": {"links": {}}}}
+        )
+        boot.flush_writes()
+        if hasattr(boot, "close"):
+            boot.close()
+
+        s1 = store_factory(db_arg)
+        s2 = store_factory(db_arg)
+        barrier = threading.Barrier(2)
+        s1_done = threading.Event()
+        o1, o2 = s1._backend_read_item, s2._backend_read_item
+
+        def r1(*a, **k):
+            v = o1(*a, **k)
+            barrier.wait(timeout=5)
+            return v
+
+        def r2(*a, **k):
+            v = o2(*a, **k)
+            barrier.wait(timeout=5)
+            s1_done.wait(timeout=5)
+            return v
+
+        s1._backend_read_item = r1
+        s2._backend_read_item = r2
+        out: dict = {}
+
+        def go(label, store, item_type, title, wp):
+            try:
+                out[label] = store.create_item(
+                    item_type=item_type,
+                    text="same-text",
+                    title=title,
+                    work_package_id=wp,
+                )
+            except StorageError as exc:
+                out[label] = exc
+            if label == "s1":
+                s1_done.set()
+
+        t1 = threading.Thread(target=go, args=("s1", s1, "X", "first", "wp-A"))
+        t2 = threading.Thread(target=go, args=("s2", s2, "Y", "second", "wp-B"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        s1.flush_writes()
+        s2.flush_writes()
+        if hasattr(s1, "close"):
+            s1.close()
+        if hasattr(s2, "close"):
+            s2.close()
+        return out
+
+    def _assert_one_winner(self, out, store) -> None:
+        successes = [v for v in out.values() if not isinstance(v, StorageError)]
+        failures = [v for v in out.values() if isinstance(v, StorageError)]
+        self.assertEqual(len(successes), 1, msg=f"both succeeded: {out}")
+        self.assertEqual(len(failures), 1, msg=f"both failed: {out}")
+        self.assertIn("same text sha256 already exists", str(failures[0]))
+        winner = successes[0]
+        persisted = store._backend_read_item(winner["text_sha256"])
+        self.assertEqual(persisted["record_sha256"], winner["record_sha256"])
+
+    def test_sqlite_create_item_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            out = self._race(SqliteTextStore, db)
+            verifier = SqliteTextStore(db)
+            try:
+                self._assert_one_winner(out, verifier)
+            finally:
+                verifier.close()
+
+    def test_filesystem_create_item_races_resolve_to_one_winner(self) -> None:
+        with TemporaryDirectory() as td:
+            out = self._race(lambda root: TextStore(root, now_fn=AdvancingClock()), td)
+            verifier = TextStore(td)
+            self._assert_one_winner(out, verifier)
 
 
 class MigrateToolTests(unittest.TestCase):

@@ -122,6 +122,17 @@ class BaseTextStore:
     def _persist_item(self, item: dict[str, Any]) -> None:
         raise NotImplementedError
 
+    def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
+        """Insert item, raising if a different item already has this text_sha256.
+
+        Cross-process duplicate detection: cache_lock + _backend_read_item is
+        a TOCTOU pair across instances/processes. This method must give an
+        atomic CAS guarantee at the storage layer (e.g. UNIQUE-constraint
+        insert) and reject conflicts with a different payload. Same-payload
+        re-inserts are tolerated as idempotent.
+        """
+        raise NotImplementedError
+
     def _backend_get_head(self, work_package_id: str, item_type: str) -> str | None:
         raise NotImplementedError
 
@@ -389,8 +400,11 @@ class BaseTextStore:
                     work_package_id, item_type, predecessor_rule, validated_links
                 )
 
+            # Synchronous strict insert closes the cross-process / cross-
+            # instance race: cache_lock + _backend_read_item is per-instance
+            # only. The backend MUST give an atomic CAS guarantee here.
+            self._backend_insert_item_strict(item)
             self._cache_item(item)
-            self._enqueue_write(item)
 
             if predecessor_rule is not None:
                 supplied_prev = validated_links.get(predecessor_rule.name)
@@ -1314,6 +1328,36 @@ class FilesystemTextStore(BaseTextStore):
         item_path = self.items_dir / f"{item['text_sha256']}.json"
         self._persist_item_to_disk(item_path, item)
 
+    def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
+        item_path = self.items_dir / f"{item['text_sha256']}.json"
+        # O_EXCL gives atomic create-if-not-exists at the FS layer; this is
+        # the cross-process equivalent of SQLite's UNIQUE-constraint insert.
+        payload = json.dumps(item, indent=2, sort_keys=True) + "\n"
+        try:
+            import os as _os
+            fd = _os.open(
+                str(item_path),
+                _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
+                0o644,
+            )
+        except FileExistsError:
+            existing = self._read_item_file(item_path, strict=True)
+            if existing is None or not self._same_item(existing, item):
+                raise StorageError(
+                    "An item with the same text sha256 already exists and "
+                    "cannot be updated"
+                )
+            return
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        except Exception:
+            try:
+                item_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
     def _heads_key(self, work_package_id: str, item_type: str) -> str:
         return f"{work_package_id}\x00{item_type}"
 
@@ -1599,6 +1643,32 @@ class SqliteTextStore(BaseTextStore):
                 "  work_package_id = excluded.work_package_id, "
                 "  payload = excluded.payload",
                 (item["text_sha256"], item["work_package_id"], payload),
+            )
+
+    def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
+        payload = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        with self.db_lock:
+            cur = self.conn.execute(
+                "INSERT INTO items (text_sha256, work_package_id, payload) "
+                "VALUES (?, ?, ?) ON CONFLICT(text_sha256) DO NOTHING",
+                (item["text_sha256"], item["work_package_id"], payload),
+            )
+            if cur.rowcount == 1:
+                return
+            row = self.conn.execute(
+                "SELECT payload FROM items WHERE text_sha256 = ?",
+                (item["text_sha256"],),
+            ).fetchone()
+        if row is None:
+            raise StorageError(
+                "Insert returned 0 rows but no existing item found for "
+                f"text_sha256={item['text_sha256']}"
+            )
+        existing = json.loads(row[0])
+        if not self._same_item(existing, item):
+            raise StorageError(
+                "An item with the same text sha256 already exists and cannot "
+                "be updated"
             )
 
     def _backend_get_head(self, work_package_id: str, item_type: str) -> str | None:
