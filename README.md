@@ -157,6 +157,79 @@ PYTHONPATH=src python3 -m hashharness.mcp_server
 
 HTTP transport exposes `POST /mcp` for JSON-RPC and `GET /health`. Notifications return `202 Accepted`; requests with an `id` return the JSON-RPC response body.
 
+## Turnkey setup for Codex and Claude Code
+
+This repo now includes checked-in example MCP configs for both clients:
+
+- Codex: [examples/codex/config.toml](examples/codex/config.toml)
+- Claude Code: [examples/claude/.mcp.json](examples/claude/.mcp.json)
+
+The examples assume the default local HTTP server URL:
+
+```text
+http://127.0.0.1:38417/mcp
+```
+
+### 1. Start the server
+
+Using `make`:
+
+```bash
+make install
+make server
+```
+
+Or using the helper script:
+
+```bash
+bash scripts/run-mcp-http.sh
+```
+
+To confirm the HTTP endpoint is up:
+
+```bash
+make health
+```
+
+or:
+
+```bash
+bash scripts/healthcheck-http.sh
+```
+
+### 2. Connect Codex
+
+Official Codex CLI command:
+
+```bash
+codex mcp add hashharness --url http://127.0.0.1:38417/mcp
+codex mcp list
+```
+
+If you prefer editing config directly, copy the stanza from
+[examples/codex/config.toml](examples/codex/config.toml) into `~/.codex/config.toml`.
+
+### 3. Connect Claude Code
+
+Official Claude Code CLI command:
+
+```bash
+claude mcp add --transport http hashharness http://127.0.0.1:38417/mcp
+claude mcp list
+```
+
+If you prefer project-scoped config, copy
+[examples/claude/.mcp.json](examples/claude/.mcp.json) to your project root as `.mcp.json`.
+Then open Claude Code in that project and confirm the server under `/mcp`.
+
+### Notes
+
+- The checked-in Codex file is an example, not an auto-loaded project config. Codex reads
+  MCP entries from your user config or `codex mcp add`.
+- The checked-in Claude file is a project example. Claude Code only loads it when it is
+  present at the project root as `.mcp.json`.
+- If you change the port, update both the running server and the MCP client URL.
+
 ## Test
 
 ```bash

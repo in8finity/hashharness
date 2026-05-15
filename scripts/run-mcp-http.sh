@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_PYTHON="$ROOT_DIR/.venv/bin/python"
+
+if [[ -x "$VENV_PYTHON" ]]; then
+  PYTHON_BIN="$VENV_PYTHON"
+else
+  PYTHON_BIN="${PYTHON:-python3}"
+fi
+
+: "${HASHHARNESS_HTTP_HOST:=127.0.0.1}"
+: "${HASHHARNESS_HTTP_PORT:=38417}"
+: "${HASHHARNESS_STORAGE_BACKEND:=sqlite}"
+: "${HASHHARNESS_DATA_DIR:=$HOME/.hashharness/hashharness.sqlite}"
+
+exec env \
+  HASHHARNESS_MCP_TRANSPORT=http \
+  HASHHARNESS_HTTP_HOST="$HASHHARNESS_HTTP_HOST" \
+  HASHHARNESS_HTTP_PORT="$HASHHARNESS_HTTP_PORT" \
+  HASHHARNESS_STORAGE_BACKEND="$HASHHARNESS_STORAGE_BACKEND" \
+  HASHHARNESS_DATA_DIR="$HASHHARNESS_DATA_DIR" \
+  "$PYTHON_BIN" -m hashharness.mcp_server

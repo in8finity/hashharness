@@ -1,0 +1,5 @@
+# Copy this stanza into ~/.codex/config.toml, or add the equivalent entry with:
+# codex mcp add hashharness --url http://127.0.0.1:38417/mcp
+
+[mcp_servers.hashharness]
+url = "http://127.0.0.1:38417/mcp"
