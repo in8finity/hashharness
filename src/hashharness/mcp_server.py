@@ -697,7 +697,16 @@ def main() -> None:
     backend = os.environ.get("HASHHARNESS_STORAGE_BACKEND", "filesystem")
     default_path = "data" if backend == "filesystem" else "data/hashharness.sqlite"
     data_path = Path(os.environ.get("HASHHARNESS_DATA_DIR", default_path))
-    store = make_store(backend, data_path)
+    store = make_store(
+        backend,
+        data_path,
+        wal_autocheckpoint_pages=int(
+            os.environ.get("HASHHARNESS_WAL_AUTOCHECKPOINT_PAGES", "1000")
+        ),
+        wal_checkpoint_writes=int(
+            os.environ.get("HASHHARNESS_WAL_CHECKPOINT_WRITES", "1000")
+        ),
+    )
     app = MCPApplication(store)
 
     transport = os.environ.get("HASHHARNESS_MCP_TRANSPORT", "stdio")

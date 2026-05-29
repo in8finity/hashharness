@@ -127,7 +127,7 @@ Pre-versioning data is migrated lazily on store init: the previously stored sing
 ## Storage backends
 
 - **Filesystem** (`data/items/<text_sha256>.json` per record, `data/schemas/<record_sha256>.json` per schema version, `data/heads.json` and `data/schemas/HEAD` for head pointers). Plain JSON; directly grep-able.
-- **Sqlite** (`items`, `schema_versions`, `schema_head`, `heads`, `schema_kv`, `tip_attributes` tables). WAL journal mode. `items` is indexed on both `work_package_id` and `record_sha256` (the latter lets head resolution skip whole-chain scans); `tip_attributes` is a maintained projection of each current tip's attributes, reverse-indexed for O(matching) `find_tips_where`.
+- **Sqlite** (`items`, `schema_versions`, `schema_head`, `heads`, `schema_kv`, `tip_attributes` tables). WAL journal mode. `items` is indexed on both `work_package_id` and `record_sha256` (the latter lets head resolution skip whole-chain scans); `tip_attributes` is a maintained projection of each current tip's attributes, reverse-indexed for O(matching) `find_tips_where`. The WAL is kept bounded by an explicit `wal_autocheckpoint` plus a `wal_checkpoint(TRUNCATE)` run every `HASHHARNESS_WAL_CHECKPOINT_WRITES` committed records (default 1000; `0` disables) and once more on `close()` — so a long-lived server doesn't accumulate a large WAL that readers must merge on every read. Tune via `HASHHARNESS_WAL_AUTOCHECKPOINT_PAGES` / `HASHHARNESS_WAL_CHECKPOINT_WRITES`.
 
 Records are cached in memory by `work_package_id`. A cached work package stays resident for 5 minutes after its last use; any access refreshes the TTL for the whole package.
 

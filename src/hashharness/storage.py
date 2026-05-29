@@ -1551,10 +1551,20 @@ class SqliteTextStore(BaseTextStore):
         cache_ttl_seconds: float = 300.0,
         clock: Any | None = None,
         now_fn: Any | None = None,
+        wal_autocheckpoint_pages: int = 1000,
+        wal_checkpoint_writes: int = 1000,
     ) -> None:
         self.db_path = Path(path)
         self.db_lock = threading.RLock()
         self.conn: sqlite3.Connection | None = None
+        # WAL never shrinks under PASSIVE autocheckpoint (it resets but keeps
+        # the file), and checkpoints can starve under sustained readers — an
+        # un-truncated WAL is merged on every read. Bound it: keep incremental
+        # autocheckpoint, plus a TRUNCATE checkpoint every wal_checkpoint_writes
+        # committed records (0 disables the periodic truncate).
+        self.wal_autocheckpoint_pages = wal_autocheckpoint_pages
+        self.wal_checkpoint_writes = wal_checkpoint_writes
+        self._writes_since_checkpoint = 0
         super().__init__(cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn)
         self._migrate_legacy_schema_if_needed()
 
@@ -1568,6 +1578,9 @@ class SqliteTextStore(BaseTextStore):
         with self.db_lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute(
+                f"PRAGMA wal_autocheckpoint={int(self.wal_autocheckpoint_pages)}"
+            )
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS items ("
                 "text_sha256 TEXT PRIMARY KEY, "
@@ -1731,9 +1744,38 @@ class SqliteTextStore(BaseTextStore):
                         (record_sha256, text_sha256),
                     )
 
+    def _maybe_checkpoint(self) -> None:
+        # Call after a committed record write. Every wal_checkpoint_writes
+        # records, fold the WAL back into the db and truncate the file.
+        if self.wal_checkpoint_writes <= 0:
+            return
+        with self.db_lock:
+            self._writes_since_checkpoint += 1
+            if self._writes_since_checkpoint < self.wal_checkpoint_writes:
+                return
+            self._writes_since_checkpoint = 0
+            self.checkpoint()
+
+    def checkpoint(self) -> tuple[int, int, int]:
+        # Best-effort TRUNCATE checkpoint. Returns SQLite's
+        # (busy, log_pages, checkpointed_pages); busy=1 means readers blocked a
+        # full checkpoint — harmless, the next call retries. Never raises on
+        # contention.
+        with self.db_lock:
+            if self.conn is None:
+                return (0, 0, 0)
+            row = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return tuple(row) if row else (0, 0, 0)
+
     def close(self) -> None:
         with self.db_lock:
             if self.conn is not None:
+                # Fold the WAL back before closing so the db is self-contained
+                # and the next open isn't merging a stale WAL.
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
                 self.conn.close()
                 self.conn = None
 
@@ -1884,6 +1926,7 @@ class SqliteTextStore(BaseTextStore):
                     payload,
                 ),
             )
+        self._maybe_checkpoint()
 
     def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
         payload = json.dumps(item, sort_keys=True, ensure_ascii=False)
@@ -1899,6 +1942,7 @@ class SqliteTextStore(BaseTextStore):
                 ),
             )
             if cur.rowcount == 1:
+                self._maybe_checkpoint()
                 return
             row = self.conn.execute(
                 "SELECT payload FROM items WHERE text_sha256 = ?",
@@ -2167,6 +2211,8 @@ def make_store(
     cache_ttl_seconds: float = 300.0,
     clock: Any | None = None,
     now_fn: Any | None = None,
+    wal_autocheckpoint_pages: int = 1000,
+    wal_checkpoint_writes: int = 1000,
 ) -> BaseTextStore:
     normalized = (backend or "filesystem").lower()
     if normalized == "filesystem":
@@ -2175,6 +2221,11 @@ def make_store(
         )
     if normalized == "sqlite":
         return SqliteTextStore(
-            path, cache_ttl_seconds=cache_ttl_seconds, clock=clock, now_fn=now_fn
+            path,
+            cache_ttl_seconds=cache_ttl_seconds,
+            clock=clock,
+            now_fn=now_fn,
+            wal_autocheckpoint_pages=wal_autocheckpoint_pages,
+            wal_checkpoint_writes=wal_checkpoint_writes,
         )
     raise StorageError(f"Unsupported storage backend: {backend}")

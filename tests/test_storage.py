@@ -2406,6 +2406,66 @@ class MakeStoreTests(unittest.TestCase):
             make_store("redis", "/tmp/whatever")
 
 
+class WalCheckpointTests(unittest.TestCase):
+    """WAL stays bounded: periodic TRUNCATE checkpoint shrinks the -wal file."""
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _store(self, **kw) -> SqliteTextStore:
+        store = SqliteTextStore(
+            f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock(), **kw
+        )
+        store.set_schema({"types": {"Evidence": {"links": {}}}})
+        return store
+
+    def _wal_size(self, store) -> int:
+        wal = Path(f"{store.db_path}-wal")
+        return wal.stat().st_size if wal.exists() else 0
+
+    def _write(self, store, n: int) -> None:
+        for i in range(n):
+            store.create_item(
+                item_type="Evidence", text=f"e{i}", title=f"e{i}",
+                work_package_id=f"wp-{i}",
+            )
+
+    def test_periodic_truncate_keeps_wal_bounded(self) -> None:
+        store = self._store(wal_checkpoint_writes=5)
+        try:
+            self._write(store, 20)  # 4 truncate cycles, last lands on a boundary
+            store.flush_writes()
+            # No open reader → TRUNCATE succeeds → -wal back to 0 bytes.
+            self.assertEqual(self._wal_size(store), 0)
+        finally:
+            store.close()
+
+    def test_wal_grows_when_periodic_truncate_disabled(self) -> None:
+        store = self._store(wal_checkpoint_writes=0, wal_autocheckpoint_pages=0)
+        try:
+            self._write(store, 20)
+            store.flush_writes()
+            self.assertGreater(self._wal_size(store), 0)
+            # Manual checkpoint still works and truncates.
+            store.checkpoint()
+            self.assertEqual(self._wal_size(store), 0)
+        finally:
+            store.close()
+
+    def test_checkpoint_returns_triple_and_never_raises(self) -> None:
+        store = self._store(wal_checkpoint_writes=0)
+        try:
+            self._write(store, 3)
+            result = store.checkpoint()
+            self.assertEqual(len(result), 3)
+            self.assertTrue(all(isinstance(x, int) for x in result))
+        finally:
+            store.close()
+
+
 class TipProjectionTests(unittest.TestCase):
     """find_tips_where: O(open-work) tip lookup via the maintained projection."""
 
