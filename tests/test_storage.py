@@ -1695,6 +1695,89 @@ class SqliteTextStoreTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["checked_items"], 2)
 
+    def test_items_table_has_record_sha256_column_and_index(self) -> None:
+        self.store.create_item(
+            item_type="Evidence",
+            text="indexed evidence",
+            title="Evidence",
+            work_package_id="wp-1",
+            attributes={"author": "alice"},  # non-empty meta → record≠text sha
+        )
+        self.store.flush_writes()
+        with self.store.db_lock:
+            columns = {
+                row[1]
+                for row in self.store.conn.execute(
+                    "PRAGMA table_info(items)"
+                ).fetchall()
+            }
+            indexes = {
+                row[1]
+                for row in self.store.conn.execute(
+                    "PRAGMA index_list(items)"
+                ).fetchall()
+            }
+            row = self.store.conn.execute(
+                "SELECT record_sha256, payload FROM items WHERE record_sha256 IS NOT NULL"
+            ).fetchone()
+        self.assertIn("record_sha256", columns)
+        self.assertIn("items_record_sha256", indexes)
+        # Column value equals the payload's record_sha256.
+        self.assertEqual(row[0], json.loads(row[1])["record_sha256"])
+
+    def test_find_tips_bulk_resolves_via_record_sha256_column(self) -> None:
+        # Build a chain per work package so head ≠ first record, and confirm
+        # the tip returned is the actual head (resolved by record_sha256, not
+        # by scanning/decoding the whole chain).
+        for wp in ("wp-a", "wp-b"):
+            first = self.store.create_item(
+                item_type="Evidence", text=f"{wp}-1", title=f"{wp}-1",
+                work_package_id=wp,
+            )
+            self.store.create_item(
+                item_type="Evidence", text=f"{wp}-2", title=f"{wp}-2",
+                work_package_id=wp,
+            )
+            del first
+        self.store.flush_writes()
+        result = self.store.find_tips_bulk(["wp-a", "wp-b", "wp-missing"], "Evidence")
+        self.assertIsNone(result["wp-missing"])
+        # Non-chain type: tip is latest by created_at; both heads resolve.
+        self.assertEqual(result["wp-a"]["work_package_id"], "wp-a")
+        self.assertEqual(result["wp-b"]["work_package_id"], "wp-b")
+
+    def test_legacy_rows_without_record_sha256_are_backfilled_on_reopen(self) -> None:
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="legacy row",
+            title="Legacy",
+            work_package_id="wp-1",
+            attributes={"k": "v"},
+        )
+        self.store.flush_writes()
+        db_path = self.store.db_path
+        # Simulate a pre-column DB: blank the record_sha256 column.
+        with self.store.db_lock:
+            self.store.conn.execute("UPDATE items SET record_sha256 = NULL")
+        self.store.close()
+
+        reopened = SqliteTextStore(db_path, now_fn=AdvancingClock())
+        try:
+            with reopened.db_lock:
+                stored = reopened.conn.execute(
+                    "SELECT record_sha256 FROM items WHERE text_sha256 = ?",
+                    (item["text_sha256"],),
+                ).fetchone()[0]
+            self.assertEqual(stored, item["record_sha256"])
+            # And resolution by record_sha256 works post-backfill.
+            resolved = reopened._backend_find_item_by_record_sha256(
+                item["record_sha256"]
+            )
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved["text_sha256"], item["text_sha256"])
+        finally:
+            reopened.close()
+
 
 class SchemaCASRaceTests(unittest.TestCase):
     """Cross-instance / cross-process CAS protection for set_schema."""

@@ -1019,13 +1019,23 @@ class BaseTextStore:
             if cached:
                 self._touch_work_package(cached["work_package_id"])
                 return cached
+        item = self._backend_find_item_by_record_sha256(record_sha256)
+        if item is not None:
+            self._get_or_load_work_package_cache(item["work_package_id"])
+            with self.cache_lock:
+                cached_pkg = self.work_package_cache.get(item["work_package_id"])
+            if cached_pkg:
+                return cached_pkg.items_by_sha.get(item["text_sha256"], item)
+            return item
+        return None
+
+    def _backend_find_item_by_record_sha256(
+        self, record_sha256: str
+    ) -> dict[str, Any] | None:
+        # Default: linear scan. Backends with a record_sha256 index override
+        # this to resolve in O(1).
         for item in self._backend_iter_items():
             if item.get("record_sha256") == record_sha256:
-                self._get_or_load_work_package_cache(item["work_package_id"])
-                with self.cache_lock:
-                    cached_pkg = self.work_package_cache.get(item["work_package_id"])
-                if cached_pkg:
-                    return cached_pkg.items_by_sha.get(item["text_sha256"], item)
                 return item
         return None
 
@@ -1476,12 +1486,30 @@ class SqliteTextStore(BaseTextStore):
                 "CREATE TABLE IF NOT EXISTS items ("
                 "text_sha256 TEXT PRIMARY KEY, "
                 "work_package_id TEXT NOT NULL, "
+                "record_sha256 TEXT, "
                 "payload TEXT NOT NULL"
                 ")"
             )
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS items_work_package "
                 "ON items(work_package_id)"
+            )
+            # record_sha256 is a record's link id (distinct from the
+            # text_sha256 PK whenever metadata is non-empty). Promoting it to
+            # an indexed column lets head resolution fetch tips directly
+            # (WHERE record_sha256 IN (...)) instead of scanning whole
+            # work-package chains. Added after the original schema, so an
+            # existing items table needs the column backfilled.
+            existing_columns = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(items)").fetchall()
+            }
+            if "record_sha256" not in existing_columns:
+                self.conn.execute("ALTER TABLE items ADD COLUMN record_sha256 TEXT")
+            self._backfill_record_sha256_column()
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS items_record_sha256 "
+                "ON items(record_sha256)"
             )
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_kv ("
@@ -1509,6 +1537,26 @@ class SqliteTextStore(BaseTextStore):
                 "record_sha256 TEXT NOT NULL"
                 ")"
             )
+
+    def _backfill_record_sha256_column(self) -> None:
+        # Populate items.record_sha256 for rows written before the column
+        # existed. Runs once: after backfill no rows match IS NULL. Rows whose
+        # payload genuinely lacks a record_sha256 are left NULL (they never
+        # match a head lookup anyway).
+        with self.db_lock:
+            rows = self.conn.execute(
+                "SELECT text_sha256, payload FROM items WHERE record_sha256 IS NULL"
+            ).fetchall()
+            for text_sha256, payload in rows:
+                item = self._decode_payload(payload, context=text_sha256, strict=False)
+                if item is None:
+                    continue
+                record_sha256 = item.get("record_sha256")
+                if record_sha256:
+                    self.conn.execute(
+                        "UPDATE items SET record_sha256 = ? WHERE text_sha256 = ?",
+                        (record_sha256, text_sha256),
+                    )
 
     def close(self) -> None:
         with self.db_lock:
@@ -1618,6 +1666,20 @@ class SqliteTextStore(BaseTextStore):
             if item is not None:
                 yield item
 
+    def _backend_find_item_by_record_sha256(
+        self, record_sha256: str
+    ) -> dict[str, Any] | None:
+        with self.db_lock:
+            rows = self.conn.execute(
+                "SELECT text_sha256, payload FROM items WHERE record_sha256 = ?",
+                (record_sha256,),
+            ).fetchall()
+        for text_sha256, payload in rows:
+            item = self._decode_payload(payload, context=text_sha256, strict=False)
+            if item is not None and item.get("record_sha256") == record_sha256:
+                return item
+        return None
+
     def _backend_iter_items_for_work_package(
         self, work_package_id: str
     ) -> Iterator[dict[str, Any]]:
@@ -1636,21 +1698,32 @@ class SqliteTextStore(BaseTextStore):
         payload = json.dumps(item, sort_keys=True, ensure_ascii=False)
         with self.db_lock:
             self.conn.execute(
-                "INSERT INTO items (text_sha256, work_package_id, payload) "
-                "VALUES (?, ?, ?) "
+                "INSERT INTO items (text_sha256, work_package_id, record_sha256, payload) "
+                "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(text_sha256) DO UPDATE SET "
                 "  work_package_id = excluded.work_package_id, "
+                "  record_sha256 = excluded.record_sha256, "
                 "  payload = excluded.payload",
-                (item["text_sha256"], item["work_package_id"], payload),
+                (
+                    item["text_sha256"],
+                    item["work_package_id"],
+                    item.get("record_sha256"),
+                    payload,
+                ),
             )
 
     def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
         payload = json.dumps(item, sort_keys=True, ensure_ascii=False)
         with self.db_lock:
             cur = self.conn.execute(
-                "INSERT INTO items (text_sha256, work_package_id, payload) "
-                "VALUES (?, ?, ?) ON CONFLICT(text_sha256) DO NOTHING",
-                (item["text_sha256"], item["work_package_id"], payload),
+                "INSERT INTO items (text_sha256, work_package_id, record_sha256, payload) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(text_sha256) DO NOTHING",
+                (
+                    item["text_sha256"],
+                    item["work_package_id"],
+                    item.get("record_sha256"),
+                    payload,
+                ),
             )
             if cur.rowcount == 1:
                 return
@@ -1748,15 +1821,18 @@ class SqliteTextStore(BaseTextStore):
                 for wp_id, record_sha256 in rows:
                     heads[wp_id] = record_sha256
 
-            wps_with_heads = list(heads.keys())
             record_to_item: dict[str, dict[str, Any]] = {}
-            target_records = set(heads.values())
-            for chunk in _chunked(wps_with_heads, 500):
+            target_records = list(dict.fromkeys(heads.values()))
+            # Resolve each head directly via the indexed record_sha256 column —
+            # O(N heads), not O(all items in those work-packages). Without this
+            # the resolver decoded every record of every chain (status / report
+            # / heartbeat history) just to recover one tip per chain.
+            for chunk in _chunked(target_records, 500):
                 placeholders = ",".join("?" * len(chunk))
                 with self.db_lock:
                     rows = self.conn.execute(
                         f"SELECT text_sha256, payload FROM items "
-                        f"WHERE work_package_id IN ({placeholders})",
+                        f"WHERE record_sha256 IN ({placeholders})",
                         chunk,
                     ).fetchall()
                 for text_sha256, payload in rows:
