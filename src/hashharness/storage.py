@@ -413,6 +413,7 @@ class BaseTextStore:
                     item_type,
                     item["record_sha256"],
                     expected_prev=supplied_prev,
+                    attributes=item["attributes"],
                 )
 
             return item
@@ -978,6 +979,7 @@ class BaseTextStore:
         record_sha256: str,
         *,
         expected_prev: str | None,
+        attributes: dict[str, Any] | None = None,
     ) -> None:
         # Persist with cross-process CAS BEFORE updating the in-memory cache,
         # so a losing race leaves the cache untouched (and re-reads will refresh
@@ -987,6 +989,52 @@ class BaseTextStore:
         )
         with self.cache_lock:
             self.heads[(work_package_id, item_type)] = record_sha256
+        # Maintain the tip-attribute projection (backends with one). The CAS
+        # already committed the head; this is the only writer of the head, so
+        # the projection follows the authoritative head.
+        self._backend_index_tip(
+            work_package_id, item_type, record_sha256, attributes or {}
+        )
+
+    def _backend_index_tip(
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        # Default: no projection maintained. Backends that support O(open-work)
+        # tip queries override this to record the current tip's attributes.
+        return None
+
+    def find_tips_where(
+        self,
+        item_type: str,
+        where_attributes: dict[str, Any],
+        work_package_ids: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return {work_package_id: tip item} for every chain whose *current*
+        tip matches all of where_attributes. Unlike find_tips_bulk, the caller
+        need not enumerate candidate work packages — backends with a tip
+        projection answer this in O(matching tips). Optional work_package_ids
+        restricts the result to that set."""
+        if not where_attributes:
+            raise StorageError("find_tips_where requires a non-empty where_attributes")
+        # Generic fallback: group all items of this type by work package,
+        # compute each tip, filter. O(all items of type) — backends override.
+        restrict = set(work_package_ids) if work_package_ids is not None else None
+        candidate_wps: set[str] = set()
+        for item in self._backend_iter_items():
+            if item.get("type") != item_type:
+                continue
+            wp = item.get("work_package_id")
+            if restrict is not None and wp not in restrict:
+                continue
+            candidate_wps.add(wp)
+        tips = self.find_tips_bulk(
+            sorted(candidate_wps), item_type, where_attributes=where_attributes
+        )
+        return {wp: item for wp, item in tips.items() if item is not None}
 
     def _bootstrap_head(self, work_package_id: str, item_type: str) -> str | None:
         rule = self._chain_predecessor_rule_for_type(item_type)
@@ -1023,7 +1071,13 @@ class BaseTextStore:
         # bootstrapped concurrently, swallow the CAS loss — they wrote
         # equivalent state.
         try:
-            self._set_head(work_package_id, item_type, head, expected_prev=None)
+            self._set_head(
+                work_package_id,
+                item_type,
+                head,
+                expected_prev=None,
+                attributes=tips[0].get("attributes", {}),
+            )
         except StorageError:
             pass
         return head
@@ -1569,6 +1623,93 @@ class SqliteTextStore(BaseTextStore):
                 "record_sha256 TEXT NOT NULL"
                 ")"
             )
+            # Tip-attribute projection: one row per (chain tip, attribute key),
+            # carrying the current head's record_sha256 and the canonical-JSON
+            # attribute value. Lets find_tips_where answer "which chains have a
+            # current tip with attr X=Y" in O(matching tips) via the reverse
+            # index, instead of resolving every head and filtering. Maintained
+            # on every head advance (_backend_index_tip).
+            tip_table_exists = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tip_attributes'"
+            ).fetchone()
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS tip_attributes ("
+                "work_package_id TEXT NOT NULL, "
+                "item_type TEXT NOT NULL, "
+                "record_sha256 TEXT NOT NULL, "
+                "attr_key TEXT NOT NULL, "
+                "attr_value TEXT NOT NULL, "
+                "PRIMARY KEY (work_package_id, item_type, attr_key)"
+                ")"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS tip_attributes_lookup "
+                "ON tip_attributes(item_type, attr_key, attr_value)"
+            )
+            if tip_table_exists is None:
+                self._rebuild_tip_attributes()
+
+    @staticmethod
+    def _attr_value_key(value: Any) -> str:
+        # Canonical text form so equality matching is type-aware ("1" ≠ 1 ≠
+        # true) and nested values compare by structure.
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+    def _index_tip_rows(
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        # Caller holds db_lock. Replace this tip's projection rows.
+        self.conn.execute(
+            "DELETE FROM tip_attributes WHERE work_package_id = ? AND item_type = ?",
+            (work_package_id, item_type),
+        )
+        if not attributes:
+            return
+        self.conn.executemany(
+            "INSERT INTO tip_attributes "
+            "(work_package_id, item_type, record_sha256, attr_key, attr_value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (work_package_id, item_type, record_sha256, key, self._attr_value_key(value))
+                for key, value in attributes.items()
+            ],
+        )
+
+    def _backend_index_tip(
+        self,
+        work_package_id: str,
+        item_type: str,
+        record_sha256: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        with self.db_lock:
+            self._index_tip_rows(work_package_id, item_type, record_sha256, attributes)
+
+    def _rebuild_tip_attributes(self) -> None:
+        # One-time (or repair) rebuild from the authoritative heads table.
+        # Caller holds db_lock. O(number of chains).
+        with self.db_lock:
+            self.conn.execute("DELETE FROM tip_attributes")
+            heads = self.conn.execute(
+                "SELECT work_package_id, item_type, record_sha256 FROM heads"
+            ).fetchall()
+            for work_package_id, item_type, record_sha256 in heads:
+                row = self.conn.execute(
+                    "SELECT payload FROM items WHERE record_sha256 = ?",
+                    (record_sha256,),
+                ).fetchone()
+                if row is None:
+                    continue
+                item = self._decode_payload(row[0], context=record_sha256, strict=False)
+                if item is None:
+                    continue
+                self._index_tip_rows(
+                    work_package_id, item_type, record_sha256, item.get("attributes", {})
+                )
 
     def _backfill_record_sha256_column(self) -> None:
         # Populate items.record_sha256 for rows written before the column
@@ -1934,6 +2075,70 @@ class SqliteTextStore(BaseTextStore):
                 for wp_id in unique_ids
             }
         return {wp_id: by_wp.get(wp_id) for wp_id in unique_ids}
+
+    def find_tips_where(
+        self,
+        item_type: str,
+        where_attributes: dict[str, Any],
+        work_package_ids: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if not where_attributes:
+            raise StorageError("find_tips_where requires a non-empty where_attributes")
+        restrict = set(work_package_ids) if work_package_ids is not None else None
+
+        # Intersect candidate work packages across predicates using the reverse
+        # index — each predicate query touches only matching tip rows, so the
+        # whole call is O(matching tips), independent of total history.
+        candidates: dict[str, str] | None = None  # wp -> head record_sha256
+        for key, value in where_attributes.items():
+            attr_value = self._attr_value_key(value)
+            with self.db_lock:
+                rows = self.conn.execute(
+                    "SELECT work_package_id, record_sha256 FROM tip_attributes "
+                    "WHERE item_type = ? AND attr_key = ? AND attr_value = ?",
+                    (item_type, key, attr_value),
+                ).fetchall()
+            matched = {wp: rec for wp, rec in rows}
+            if candidates is None:
+                candidates = matched
+            else:
+                candidates = {
+                    wp: rec for wp, rec in candidates.items() if wp in matched
+                }
+            if not candidates:
+                return {}
+
+        assert candidates is not None
+        if restrict is not None:
+            candidates = {wp: rec for wp, rec in candidates.items() if wp in restrict}
+        if not candidates:
+            return {}
+
+        # Resolve the matching heads directly via the indexed record_sha256.
+        target_records = list(dict.fromkeys(candidates.values()))
+        record_to_item: dict[str, dict[str, Any]] = {}
+        for chunk in _chunked(target_records, 500):
+            placeholders = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows = self.conn.execute(
+                    f"SELECT text_sha256, payload FROM items "
+                    f"WHERE record_sha256 IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            for text_sha256, payload in rows:
+                item = self._decode_payload(payload, context=text_sha256, strict=False)
+                if item is None:
+                    continue
+                rec = item.get("record_sha256")
+                if rec in target_records and item.get("type") == item_type:
+                    record_to_item[rec] = item
+
+        result: dict[str, dict[str, Any]] = {}
+        for wp, rec in candidates.items():
+            item = record_to_item.get(rec)
+            if item is not None:
+                result[wp] = item
+        return result
 
     def _decode_payload(
         self, payload: str, *, context: str, strict: bool = True

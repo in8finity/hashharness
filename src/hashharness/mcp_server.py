@@ -159,6 +159,26 @@ class MCPApplication:
                 else:
                     projected[wp_id] = self._project_item(item, fields)
             return self._tool_result({"tips": projected})
+        if name == "find_tips_where":
+            ids = arguments.get("work_package_ids")
+            if ids is not None:
+                if not isinstance(ids, list):
+                    raise StorageError("work_package_ids must be a list")
+                if len(ids) > 10000:
+                    raise StorageError("work_package_ids exceeds maximum of 10000 per call")
+            where = arguments.get("where_attributes")
+            if not isinstance(where, dict) or not where:
+                raise StorageError("where_attributes must be a non-empty object")
+            tips = self.store.find_tips_where(
+                arguments["type"], where, work_package_ids=ids
+            )
+            fields = arguments.get("fields")
+            projected: dict[str, dict[str, Any]] = {}
+            for wp_id, item in tips.items():
+                projected[wp_id] = (
+                    item if fields is None else self._project_item(item, fields)
+                )
+            return self._tool_result({"tips": projected})
         if name == "query_chain":
             result = self.store.query_chain(arguments["text_sha256"])
             return self._tool_result(result)
@@ -394,6 +414,39 @@ class MCPApplication:
                         },
                     },
                     "required": ["work_package_ids", "type"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "find_tips_where",
+                "description": (
+                    "Return current chain tips whose attributes match where_attributes "
+                    "(exact key/value), keyed by work_package_id. Unlike find_tips_bulk "
+                    "you need not enumerate candidate work packages: the sqlite backend "
+                    "answers in O(matching tips) via a maintained tip-attribute index, so "
+                    "'all TaskStatus tips with status=new' stays cheap as history grows. "
+                    "Optional work_package_ids restricts the result to that set."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "where_attributes": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "minProperties": 1,
+                        },
+                        "work_package_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 10000,
+                        },
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["type", "where_attributes"],
                     "additionalProperties": False,
                 },
             },

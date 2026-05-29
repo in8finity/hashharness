@@ -120,13 +120,14 @@ Pre-versioning data is migrated lazily on store init: the previously stored sing
 | `get_work_package` | Return every record in one `work_package_id`, optionally filtered by `type`. |
 | `find_tip` | Return the chain head for `(work_package_id, item_type)`. For chain types, O(1) head lookup; otherwise picks max-`created_at` (legacy fallback). Optional `where_attributes` requires the tip's attributes to match exactly; a non-matching tip is treated as no tip. |
 | `find_tips_bulk` | Batched form of `find_tip`: one `(type, [work_package_ids])` call returns a dict keyed by `work_package_id`, with missing chains mapped to `null`. Up to 10000 ids per call. Sqlite resolves heads directly via the indexed `record_sha256` column (O(N heads)); filesystem backend loops `find_tip`. Optional `where_attributes` filters to tips whose attributes match (e.g. `{"status":"new"}`); non-matching tips map to `null`. Intended for dashboards / summary views over many chains. |
+| `find_tips_where` | Return current chain tips whose attributes match `where_attributes` (exact key/value), keyed by `work_package_id`, **without enumerating candidate work packages**. The sqlite backend answers in O(matching tips) via a maintained tip-attribute projection (`tip_attributes`), so "all `TaskStatus` tips with `status=new`" stays flat as terminal history grows. Optional `work_package_ids` restricts the result. |
 | `query_chain` | Walk from a root `text_sha256`, following `record_sha256` links transitively; return all records in the chain. |
 | `verify_chain` | Recompute every hash for every record reachable from a root `text_sha256`. Reports per-item `ok`/`errors`. With `summary=true`, returns only `ok`, `checked_items`, `errors_count`, `root_text_sha256`. |
 
 ## Storage backends
 
 - **Filesystem** (`data/items/<text_sha256>.json` per record, `data/schemas/<record_sha256>.json` per schema version, `data/heads.json` and `data/schemas/HEAD` for head pointers). Plain JSON; directly grep-able.
-- **Sqlite** (`items`, `schema_versions`, `schema_head`, `heads`, `schema_kv` tables). WAL journal mode.
+- **Sqlite** (`items`, `schema_versions`, `schema_head`, `heads`, `schema_kv`, `tip_attributes` tables). WAL journal mode. `items` is indexed on both `work_package_id` and `record_sha256` (the latter lets head resolution skip whole-chain scans); `tip_attributes` is a maintained projection of each current tip's attributes, reverse-indexed for O(matching) `find_tips_where`.
 
 Records are cached in memory by `work_package_id`. A cached work package stays resident for 5 minutes after its last use; any access refreshes the TTL for the whole package.
 

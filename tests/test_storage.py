@@ -2406,6 +2406,146 @@ class MakeStoreTests(unittest.TestCase):
             make_store("redis", "/tmp/whatever")
 
 
+class TipProjectionTests(unittest.TestCase):
+    """find_tips_where: O(open-work) tip lookup via the maintained projection."""
+
+    CHAIN_SCHEMA = {
+        "types": {
+            "TaskStatus": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["TaskStatus"],
+                        "chain_predecessor": True,
+                    }
+                }
+            }
+        }
+    }
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _make(self, backend: str):
+        if backend == "fs":
+            store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        else:
+            store = SqliteTextStore(
+                f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock()
+            )
+        store.set_schema(self.CHAIN_SCHEMA)
+        return store
+
+    def _advance(self, store, wp: str, status: str) -> dict:
+        head = store._get_head(wp, "TaskStatus")
+        links = {} if head is None else {"prev": head}
+        return store.create_item(
+            item_type="TaskStatus",
+            text=f"{wp}:{status}:{head or 'genesis'}",
+            title=status,
+            work_package_id=wp,
+            attributes={"status": status},
+            links=links,
+        )
+
+    def _run(self, backend: str) -> None:
+        store = self._make(backend)
+        try:
+            self._advance(store, "wp-open1", "new")
+            self._advance(store, "wp-open2", "new")
+            self._advance(store, "wp-done", "new")
+            self._advance(store, "wp-done", "done")
+            store.flush_writes()
+
+            # Only the two open chains come back — caller did NOT enumerate ids.
+            open_tips = store.find_tips_where("TaskStatus", {"status": "new"})
+            self.assertEqual(set(open_tips), {"wp-open1", "wp-open2"})
+            self.assertTrue(
+                all(t["attributes"]["status"] == "new" for t in open_tips.values())
+            )
+
+            # Advancing an open chain drops it from the projection's "new" set.
+            self._advance(store, "wp-open1", "working")
+            store.flush_writes()
+            open_after = store.find_tips_where("TaskStatus", {"status": "new"})
+            self.assertEqual(set(open_after), {"wp-open2"})
+            self.assertEqual(
+                set(store.find_tips_where("TaskStatus", {"status": "done"})), {"wp-done"}
+            )
+
+            # Restriction to a candidate set intersects.
+            restricted = store.find_tips_where(
+                "TaskStatus", {"status": "new"}, work_package_ids=["wp-open2", "wp-done"]
+            )
+            self.assertEqual(set(restricted), {"wp-open2"})
+
+            # Empty predicate is rejected.
+            with self.assertRaises(StorageError):
+                store.find_tips_where("TaskStatus", {})
+        finally:
+            store.flush_writes()
+            if isinstance(store, SqliteTextStore):
+                store.close()
+
+    def test_find_tips_where_filesystem(self) -> None:
+        self._run("fs")
+
+    def test_find_tips_where_sqlite(self) -> None:
+        self._run("sqlite")
+
+    def test_projection_rebuilt_on_reopen(self) -> None:
+        store = self._make("sqlite")
+        self._advance(store, "wp-1", "new")
+        self._advance(store, "wp-2", "new")
+        self._advance(store, "wp-2", "done")
+        store.flush_writes()
+        db_path = store.db_path
+        # Simulate a pre-projection DB: drop the table entirely.
+        with store.db_lock:
+            store.conn.execute("DROP TABLE tip_attributes")
+        store.close()
+
+        reopened = SqliteTextStore(db_path, now_fn=AdvancingClock())
+        try:
+            # Rebuilt from the authoritative heads table on open.
+            self.assertEqual(
+                set(reopened.find_tips_where("TaskStatus", {"status": "new"})), {"wp-1"}
+            )
+            self.assertEqual(
+                set(reopened.find_tips_where("TaskStatus", {"status": "done"})), {"wp-2"}
+            )
+        finally:
+            reopened.close()
+
+    def test_find_tips_where_via_mcp(self) -> None:
+        store = self._make("sqlite")
+        self._advance(store, "wp-a", "new")
+        self._advance(store, "wp-b", "new")
+        self._advance(store, "wp-b", "done")
+        store.flush_writes()
+        app = MCPApplication(store)
+        try:
+            out = app._call_tool(
+                {
+                    "name": "find_tips_where",
+                    "arguments": {
+                        "type": "TaskStatus",
+                        "where_attributes": {"status": "new"},
+                        "fields": ["work_package_id", "title"],
+                    },
+                }
+            )
+            tips = out["structuredContent"]["tips"]
+            self.assertEqual(set(tips), {"wp-a"})
+            self.assertEqual(tips["wp-a"]["title"], "new")
+        finally:
+            store.flush_writes()
+            store.close()
+
+
 class TipAttributeFilterTests(unittest.TestCase):
     """where_attributes filter on find_tip / find_tips_bulk, across backends and
     chain-predecessor / non-chain types."""
