@@ -134,6 +134,7 @@ class MCPApplication:
             result = self.store.find_tip(
                 arguments["work_package_id"],
                 arguments["type"],
+                where_attributes=arguments.get("where_attributes"),
             )
             fields = arguments.get("fields", ["type", "title", "text_sha256", "record_sha256", "created_at"])
             return self._tool_result(self._project_item(result, fields))
@@ -143,7 +144,11 @@ class MCPApplication:
                 raise StorageError("work_package_ids must be a list")
             if len(ids) > 10000:
                 raise StorageError("work_package_ids exceeds maximum of 10000 per call")
-            tips = self.store.find_tips_bulk(ids, arguments["type"])
+            tips = self.store.find_tips_bulk(
+                ids,
+                arguments["type"],
+                where_attributes=arguments.get("where_attributes"),
+            )
             fields = arguments.get("fields")
             projected: dict[str, dict[str, Any] | None] = {}
             for wp_id, item in tips.items():
@@ -336,7 +341,10 @@ class MCPApplication:
             {
                 "name": "find_tip",
                 "description": (
-                    "Return the most recent item by created_at for one work package and item type."
+                    "Return the tip item for one work package and item type (chain head, "
+                    "or most recent by created_at for non-chain types). Optional "
+                    "where_attributes requires the tip's attributes to match (exact "
+                    "key/value); a non-matching tip is treated as no tip."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -346,6 +354,10 @@ class MCPApplication:
                         "fields": {
                             "type": "array",
                             "items": {"type": "string"},
+                        },
+                        "where_attributes": {
+                            "type": "object",
+                            "additionalProperties": True,
                         },
                     },
                     "required": ["work_package_id", "type"],
@@ -359,7 +371,9 @@ class MCPApplication:
                     "in a single call. Result is a dict keyed by work_package_id; "
                     "missing chains map to null (no error). Up to 10000 ids per call. "
                     "Use this instead of N find_tip calls when rendering dashboards or "
-                    "summary views over many chains."
+                    "summary views over many chains. Optional where_attributes filters "
+                    "to tips whose attributes match exactly (e.g. {\"status\": \"new\"}); "
+                    "non-matching tips map to null."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -373,6 +387,10 @@ class MCPApplication:
                         "fields": {
                             "type": "array",
                             "items": {"type": "string"},
+                        },
+                        "where_attributes": {
+                            "type": "object",
+                            "additionalProperties": True,
                         },
                     },
                     "required": ["work_package_ids", "type"],

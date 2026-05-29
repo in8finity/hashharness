@@ -583,19 +583,33 @@ class BaseTextStore:
         }
 
     def find_tips_bulk(
-        self, work_package_ids: list[str], item_type: str
+        self,
+        work_package_ids: list[str],
+        item_type: str,
+        where_attributes: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any] | None]:
         result: dict[str, dict[str, Any] | None] = {}
         for work_package_id in work_package_ids:
             if work_package_id in result:
                 continue
             try:
-                result[work_package_id] = self.find_tip(work_package_id, item_type)
+                result[work_package_id] = self.find_tip(
+                    work_package_id, item_type, where_attributes=where_attributes
+                )
             except StorageError:
                 result[work_package_id] = None
         return result
 
-    def find_tip(self, work_package_id: str, item_type: str) -> dict[str, Any]:
+    def find_tip(
+        self,
+        work_package_id: str,
+        item_type: str,
+        where_attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # where_attributes filters the *tip*: the chain head (or latest-by-time
+        # for non-chain types) is selected first, then required to match. It is
+        # NOT "the latest item matching attributes" — that would break the
+        # tip's meaning. A non-matching tip is treated as no tip.
         rule = self._chain_predecessor_rule_for_type(item_type)
         if rule is not None:
             head = self._get_head(work_package_id, item_type)
@@ -609,6 +623,7 @@ class BaseTextStore:
                     f"Head record not found for work_package_id={work_package_id} "
                     f"and type={item_type}: {head}"
                 )
+            self._require_tip_attributes(item, where_attributes, work_package_id, item_type)
             return item
 
         cached = self._get_or_load_work_package_cache(work_package_id)
@@ -619,13 +634,30 @@ class BaseTextStore:
             raise StorageError(
                 f"No items found for work_package_id={work_package_id} and type={item_type}"
             )
-        return max(
+        tip = max(
             candidates,
             key=lambda item: (
                 datetime.fromisoformat(item["created_at"]),
                 item["text_sha256"],
             ),
         )
+        self._require_tip_attributes(tip, where_attributes, work_package_id, item_type)
+        return tip
+
+    def _require_tip_attributes(
+        self,
+        item: dict[str, Any],
+        where_attributes: dict[str, Any] | None,
+        work_package_id: str,
+        item_type: str,
+    ) -> None:
+        if where_attributes and not self._attributes_match(
+            item.get("attributes", {}), where_attributes
+        ):
+            raise StorageError(
+                f"Tip for work_package_id={work_package_id} and type={item_type} "
+                f"does not match where_attributes"
+            )
 
     def flush_writes(self) -> None:
         self.write_queue.join()
@@ -1801,7 +1833,10 @@ class SqliteTextStore(BaseTextStore):
                     )
 
     def find_tips_bulk(
-        self, work_package_ids: list[str], item_type: str
+        self,
+        work_package_ids: list[str],
+        item_type: str,
+        where_attributes: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any] | None]:
         if not work_package_ids:
             return {}
@@ -1855,6 +1890,11 @@ class SqliteTextStore(BaseTextStore):
                         f"Head record not found for work_package_id={wp_id} "
                         f"and type={item_type}: {record_sha256}"
                     )
+                if where_attributes and not self._attributes_match(
+                    item.get("attributes", {}), where_attributes
+                ):
+                    result[wp_id] = None
+                    continue
                 result[wp_id] = item
             return result
 
@@ -1883,6 +1923,16 @@ class SqliteTextStore(BaseTextStore):
                 )
                 if new_key > existing_key:
                     by_wp[wp_id] = item
+        if where_attributes:
+            return {
+                wp_id: (
+                    item
+                    if (item := by_wp.get(wp_id)) is not None
+                    and self._attributes_match(item.get("attributes", {}), where_attributes)
+                    else None
+                )
+                for wp_id in unique_ids
+            }
         return {wp_id: by_wp.get(wp_id) for wp_id in unique_ids}
 
     def _decode_payload(

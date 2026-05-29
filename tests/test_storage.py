@@ -2406,5 +2406,122 @@ class MakeStoreTests(unittest.TestCase):
             make_store("redis", "/tmp/whatever")
 
 
+class TipAttributeFilterTests(unittest.TestCase):
+    """where_attributes filter on find_tip / find_tips_bulk, across backends and
+    chain-predecessor / non-chain types."""
+
+    CHAIN_SCHEMA = {
+        "types": {
+            "TaskStatus": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["TaskStatus"],
+                        "chain_predecessor": True,
+                    }
+                }
+            }
+        }
+    }
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _make(self, backend: str):
+        if backend == "fs":
+            store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        else:
+            store = SqliteTextStore(
+                f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock()
+            )
+        store.set_schema(self.CHAIN_SCHEMA)
+        return store
+
+    def _advance(self, store, wp: str, status: str) -> dict:
+        head = store._get_head(wp, "TaskStatus")
+        links = {} if head is None else {"prev": head}
+        return store.create_item(
+            item_type="TaskStatus",
+            text=f"{wp}:{status}:{store._get_head(wp, 'TaskStatus') or 'genesis'}",
+            title=status,
+            work_package_id=wp,
+            attributes={"status": status},
+            links=links,
+        )
+
+    def _run(self, backend: str) -> None:
+        store = self._make(backend)
+        try:
+            # wp-open ends on `new`; wp-done ends on `done`.
+            self._advance(store, "wp-open", "new")
+            self._advance(store, "wp-done", "new")
+            self._advance(store, "wp-done", "working")
+            self._advance(store, "wp-done", "done")
+            store.flush_writes()
+
+            # find_tip: matching tip returned, non-matching raises.
+            tip = store.find_tip("wp-open", "TaskStatus", where_attributes={"status": "new"})
+            self.assertEqual(tip["attributes"]["status"], "new")
+            with self.assertRaises(StorageError):
+                store.find_tip("wp-done", "TaskStatus", where_attributes={"status": "new"})
+            # No filter still returns the true head.
+            self.assertEqual(
+                store.find_tip("wp-done", "TaskStatus")["attributes"]["status"], "done"
+            )
+
+            # find_tips_bulk: only matching tips survive; rest map to null.
+            res = store.find_tips_bulk(
+                ["wp-open", "wp-done", "wp-missing"],
+                "TaskStatus",
+                where_attributes={"status": "new"},
+            )
+            self.assertEqual(res["wp-open"]["attributes"]["status"], "new")
+            self.assertIsNone(res["wp-done"])
+            self.assertIsNone(res["wp-missing"])
+
+            # Without filter, both chains resolve to their real heads.
+            res_all = store.find_tips_bulk(["wp-open", "wp-done"], "TaskStatus")
+            self.assertEqual(res_all["wp-open"]["attributes"]["status"], "new")
+            self.assertEqual(res_all["wp-done"]["attributes"]["status"], "done")
+        finally:
+            store.flush_writes()
+            if isinstance(store, SqliteTextStore):
+                store.close()
+
+    def test_chain_tip_filter_filesystem(self) -> None:
+        self._run("fs")
+
+    def test_chain_tip_filter_sqlite(self) -> None:
+        self._run("sqlite")
+
+    def test_non_chain_tip_filter_sqlite(self) -> None:
+        store = SqliteTextStore(f"{self.tempdir.name}/h2.sqlite", now_fn=AdvancingClock())
+        store.set_schema({"types": {"Note": {"links": {}}}})
+        try:
+            store.create_item(
+                item_type="Note", text="n1", title="n1",
+                work_package_id="wp-1", attributes={"kind": "draft"},
+            )
+            store.create_item(
+                item_type="Note", text="n2", title="n2",
+                work_package_id="wp-1", attributes={"kind": "final"},
+            )
+            store.flush_writes()
+            # Tip is the latest (final); filter for draft → null, for final → hit.
+            self.assertIsNone(
+                store.find_tips_bulk(["wp-1"], "Note", where_attributes={"kind": "draft"})["wp-1"]
+            )
+            self.assertEqual(
+                store.find_tips_bulk(["wp-1"], "Note", where_attributes={"kind": "final"})["wp-1"]["title"],
+                "n2",
+            )
+        finally:
+            store.flush_writes()
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

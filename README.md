@@ -118,8 +118,8 @@ Pre-versioning data is migrated lazily on store init: the previously stored sing
 | `find_items` | Substring (default) or regex (`regex=true`) search over `text`, `title`, `work_package_id`, or `all`. Optional `fields` projection and exact-match `attributes` filter. |
 | `get_item_by_hash` | Fetch one record by `text_sha256`. |
 | `get_work_package` | Return every record in one `work_package_id`, optionally filtered by `type`. |
-| `find_tip` | Return the chain head for `(work_package_id, item_type)`. For chain types, O(1) head lookup; otherwise picks max-`created_at` (legacy fallback). |
-| `find_tips_bulk` | Batched form of `find_tip`: one `(type, [work_package_ids])` call returns a dict keyed by `work_package_id`, with missing chains mapped to `null`. Up to 10000 ids per call. Sqlite backend uses a two-query fast path (heads + items via `IN`); filesystem backend loops `find_tip`. Intended for dashboards / summary views over many chains. |
+| `find_tip` | Return the chain head for `(work_package_id, item_type)`. For chain types, O(1) head lookup; otherwise picks max-`created_at` (legacy fallback). Optional `where_attributes` requires the tip's attributes to match exactly; a non-matching tip is treated as no tip. |
+| `find_tips_bulk` | Batched form of `find_tip`: one `(type, [work_package_ids])` call returns a dict keyed by `work_package_id`, with missing chains mapped to `null`. Up to 10000 ids per call. Sqlite resolves heads directly via the indexed `record_sha256` column (O(N heads)); filesystem backend loops `find_tip`. Optional `where_attributes` filters to tips whose attributes match (e.g. `{"status":"new"}`); non-matching tips map to `null`. Intended for dashboards / summary views over many chains. |
 | `query_chain` | Walk from a root `text_sha256`, following `record_sha256` links transitively; return all records in the chain. |
 | `verify_chain` | Recompute every hash for every record reachable from a root `text_sha256`. Reports per-item `ok`/`errors`. With `summary=true`, returns only `ok`, `checked_items`, `errors_count`, `root_text_sha256`. |
 
