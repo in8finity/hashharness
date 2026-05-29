@@ -123,6 +123,8 @@ Pre-versioning data is migrated lazily on store init: the previously stored sing
 | `find_tips_where` | Return current chain tips whose attributes match `where_attributes` (exact key/value), keyed by `work_package_id`, **without enumerating candidate work packages**. The sqlite backend answers in O(matching tips) via a maintained tip-attribute projection (`tip_attributes`), so "all `TaskStatus` tips with `status=new`" stays flat as terminal history grows. Optional `work_package_ids` restricts the result. |
 | `query_chain` | Walk from a root `text_sha256`, following `record_sha256` links transitively; return all records in the chain. |
 | `verify_chain` | Recompute every hash for every record reachable from a root `text_sha256`. Reports per-item `ok`/`errors`. With `summary=true`, returns only `ok`, `checked_items`, `errors_count`, `root_text_sha256`. |
+| `list_work_packages` | Return every distinct `work_package_id` (optional `prefix` filter), sorted. Enumeration primitive for auditing the store without prior knowledge of its contents. |
+| `verify_work_package` | Verify **every** record stored in a work package (or a list via `work_package_ids`), not just those reachable from a root — so an orphan / unlinked record is caught, and each record's bound schema is re-checked against the canonical schema chain. `summary=true` for counts only. Compose with `list_work_packages` for a whole-store sweep (`verify_all`), or scope it to a pm queue / aif graph. |
 
 ## Storage backends
 

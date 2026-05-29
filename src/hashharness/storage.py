@@ -539,6 +539,43 @@ class BaseTextStore:
             "items": checked,
         }
 
+    def list_work_packages(self, prefix: str | None = None) -> list[str]:
+        """Return every distinct work_package_id (optionally restricted to those
+        starting with prefix), sorted. The enumeration primitive an auditor needs
+        to verify the store without out-of-band knowledge of what exists."""
+        seen: set[str] = set()
+        for item in self._backend_iter_items():
+            wp = item.get("work_package_id")
+            if wp and (prefix is None or wp.startswith(prefix)):
+                seen.add(wp)
+        return sorted(seen)
+
+    def verify_work_package(
+        self, work_package_id: str, *, summary: bool = False
+    ) -> dict[str, Any]:
+        """Verify EVERY record stored in one work package — not just those
+        reachable from a chosen root. Catches orphan / unlinked records a root
+        walk would miss, and (via _verify_item) re-checks each record's bound
+        schema is on the canonical schema chain. Does not transitively follow
+        links into other work packages; verify those separately if needed."""
+        checked: list[dict[str, Any]] = []
+        for item in self._backend_iter_items_for_work_package(work_package_id):
+            checked.append(self._verify_item(item))
+        ok = all(entry["ok"] for entry in checked)
+        if summary:
+            return {
+                "work_package_id": work_package_id,
+                "ok": ok,
+                "checked_items": len(checked),
+                "errors_count": sum(len(entry["errors"]) for entry in checked),
+            }
+        return {
+            "work_package_id": work_package_id,
+            "ok": ok,
+            "checked_items": len(checked),
+            "items": checked,
+        }
+
     def query_chain(self, text_sha256: str) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         seen_records: set[str] = set()
@@ -1908,6 +1945,23 @@ class SqliteTextStore(BaseTextStore):
             item = self._decode_payload(payload, context=text_sha256, strict=False)
             if item is not None:
                 yield item
+
+    def list_work_packages(self, prefix: str | None = None) -> list[str]:
+        with self.db_lock:
+            if prefix:
+                # ESCAPE so a prefix containing %/_ is matched literally.
+                like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                rows = self.conn.execute(
+                    "SELECT DISTINCT work_package_id FROM items "
+                    "WHERE work_package_id LIKE ? ESCAPE '\\' ORDER BY work_package_id",
+                    (like + "%",),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT work_package_id FROM items "
+                    "ORDER BY work_package_id"
+                ).fetchall()
+        return [row[0] for row in rows]
 
     def _persist_item(self, item: dict[str, Any]) -> None:
         payload = json.dumps(item, sort_keys=True, ensure_ascii=False)

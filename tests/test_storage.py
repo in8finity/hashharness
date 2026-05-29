@@ -2406,6 +2406,134 @@ class MakeStoreTests(unittest.TestCase):
             make_store("redis", "/tmp/whatever")
 
 
+class VerifyWorkPackageTests(unittest.TestCase):
+    """list_work_packages + verify_work_package: scoped, whole-wp integrity."""
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _store(self, backend: str):
+        if backend == "fs":
+            store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        else:
+            store = SqliteTextStore(
+                f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock()
+            )
+        store.set_schema({"types": {"Evidence": {"links": {}}}})
+        return store
+
+    def _close(self, store) -> None:
+        store.flush_writes()
+        if isinstance(store, SqliteTextStore):
+            store.close()
+
+    def _list_run(self, backend: str) -> None:
+        store = self._store(backend)
+        try:
+            store.create_item(item_type="Evidence", text="a", title="a", work_package_id="proj-1")
+            store.create_item(item_type="Evidence", text="b", title="b", work_package_id="proj-2")
+            store.create_item(item_type="Evidence", text="c", title="c", work_package_id="other-1")
+            store.flush_writes()
+            self.assertEqual(
+                store.list_work_packages(), ["other-1", "proj-1", "proj-2"]
+            )
+            self.assertEqual(
+                store.list_work_packages(prefix="proj-"), ["proj-1", "proj-2"]
+            )
+            self.assertEqual(store.list_work_packages(prefix="none-"), [])
+        finally:
+            self._close(store)
+
+    def test_list_work_packages_filesystem(self) -> None:
+        self._list_run("fs")
+
+    def test_list_work_packages_sqlite(self) -> None:
+        self._list_run("sqlite")
+
+    def test_verify_work_package_clean_and_summary(self) -> None:
+        store = self._store("sqlite")
+        try:
+            for t in ("a", "b", "c"):
+                store.create_item(item_type="Evidence", text=t, title=t, work_package_id="wp-1")
+            store.flush_writes()
+            full = store.verify_work_package("wp-1")
+            self.assertTrue(full["ok"])
+            self.assertEqual(full["checked_items"], 3)
+            self.assertEqual(len(full["items"]), 3)
+            summ = store.verify_work_package("wp-1", summary=True)
+            self.assertTrue(summ["ok"])
+            self.assertEqual(summ["checked_items"], 3)
+            self.assertEqual(summ["errors_count"], 0)
+            self.assertNotIn("items", summ)
+            # Empty / unknown wp verifies vacuously.
+            self.assertEqual(store.verify_work_package("wp-none")["checked_items"], 0)
+            self.assertTrue(store.verify_work_package("wp-none")["ok"])
+        finally:
+            self._close(store)
+
+    def test_verify_work_package_catches_orphan_that_root_walk_misses(self) -> None:
+        # Three independent (unlinked) records in one wp. verify_chain rooted at
+        # one of them only checks that one; verify_work_package checks all three,
+        # so tampering an *unreferenced* record is caught only by the latter.
+        store = self._store("sqlite")
+        try:
+            a = store.create_item(item_type="Evidence", text="a", title="a", work_package_id="wp-1")
+            b = store.create_item(item_type="Evidence", text="b", title="b", work_package_id="wp-1")
+            store.create_item(item_type="Evidence", text="c", title="c", work_package_id="wp-1")
+            store.flush_writes()
+
+            # Tamper b's metadata on disk without updating its hashes.
+            with store.db_lock:
+                row = store.conn.execute(
+                    "SELECT payload FROM items WHERE text_sha256 = ?", (b["text_sha256"],)
+                ).fetchone()
+                doc = json.loads(row[0])
+                doc["title"] = "TAMPERED"
+                store.conn.execute(
+                    "UPDATE items SET payload = ? WHERE text_sha256 = ?",
+                    (json.dumps(doc), b["text_sha256"]),
+                )
+            # Drop cache so the tampered payload is re-read from the backend.
+            store.work_package_cache.clear()
+
+            # Root walk from a clean, unrelated record: passes (never visits b).
+            self.assertTrue(store.verify_chain(a["text_sha256"])["ok"])
+            # Whole-wp verify: catches it.
+            report = store.verify_work_package("wp-1")
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["checked_items"], 3)
+            bad = [it for it in report["items"] if not it["ok"]]
+            self.assertEqual(len(bad), 1)
+            self.assertEqual(bad[0]["text_sha256"], b["text_sha256"])
+        finally:
+            self._close(store)
+
+    def test_verify_via_mcp_batch(self) -> None:
+        store = self._store("sqlite")
+        try:
+            store.create_item(item_type="Evidence", text="a", title="a", work_package_id="wp-1")
+            store.create_item(item_type="Evidence", text="b", title="b", work_package_id="wp-2")
+            store.flush_writes()
+            app = MCPApplication(store)
+            listing = app._call_tool(
+                {"name": "list_work_packages", "arguments": {}}
+            )["structuredContent"]["work_package_ids"]
+            self.assertEqual(listing, ["wp-1", "wp-2"])
+            out = app._call_tool(
+                {
+                    "name": "verify_work_package",
+                    "arguments": {"work_package_ids": listing, "summary": True},
+                }
+            )["structuredContent"]
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["checked_work_packages"], 2)
+        finally:
+            self._close(store)
+
+
 class WalCheckpointTests(unittest.TestCase):
     """WAL stays bounded: periodic TRUNCATE checkpoint shrinks the -wal file."""
 

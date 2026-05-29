@@ -179,6 +179,31 @@ class MCPApplication:
                     item if fields is None else self._project_item(item, fields)
                 )
             return self._tool_result({"tips": projected})
+        if name == "list_work_packages":
+            wps = self.store.list_work_packages(prefix=arguments.get("prefix"))
+            return self._tool_result({"work_package_ids": wps})
+        if name == "verify_work_package":
+            summary = bool(arguments.get("summary", False))
+            if "work_package_ids" in arguments:
+                ids = arguments["work_package_ids"]
+                if not isinstance(ids, list):
+                    raise StorageError("work_package_ids must be a list")
+                if len(ids) > 10000:
+                    raise StorageError("work_package_ids exceeds maximum of 10000 per call")
+                results = {
+                    wp: self.store.verify_work_package(wp, summary=summary) for wp in ids
+                }
+                return self._tool_result(
+                    {
+                        "ok": all(r["ok"] for r in results.values()),
+                        "checked_work_packages": len(results),
+                        "results": results,
+                    }
+                )
+            result = self.store.verify_work_package(
+                arguments["work_package_id"], summary=summary
+            )
+            return self._tool_result(result)
         if name == "query_chain":
             result = self.store.query_chain(arguments["text_sha256"])
             return self._tool_result(result)
@@ -447,6 +472,46 @@ class MCPApplication:
                         },
                     },
                     "required": ["type", "where_attributes"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "list_work_packages",
+                "description": (
+                    "Return every distinct work_package_id (optionally restricted to those "
+                    "starting with `prefix`), sorted. Enumeration primitive for auditing the "
+                    "store without prior knowledge of what it contains; pair with "
+                    "verify_work_package for a whole-store or scoped integrity sweep."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prefix": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "verify_work_package",
+                "description": (
+                    "Verify EVERY record stored in a work package (or a list of them via "
+                    "work_package_ids), not just those reachable from a root — so an orphan "
+                    "or unlinked record is caught, and each record's bound schema is "
+                    "re-checked against the canonical schema chain. Does not follow links "
+                    "into other work packages. With summary=true returns counts only. "
+                    "Compose with list_work_packages for a whole-store sweep."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "work_package_id": {"type": "string"},
+                        "work_package_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 10000,
+                        },
+                        "summary": {"type": "boolean"},
+                    },
                     "additionalProperties": False,
                 },
             },
