@@ -160,6 +160,14 @@ PYTHONPATH=src python3 -m hashharness.mcp_server
 
 HTTP transport exposes `POST /mcp` for JSON-RPC and `GET /health`. Notifications return `202 Accepted`; requests with an `id` return the JSON-RPC response body.
 
+**Concurrency and backpressure.** The HTTP server is multi-threaded (`ThreadingHTTPServer`) and bounds concurrent in-flight requests with a semaphore; when the cap is reached it returns **`HTTP 503` + `Retry-After`** instead of accepting another request that would queue behind the sqlite writer. Clients see "back off" rather than `ConnectionResetError`. `/health` is exempt. The listen backlog is also raised from the stdlib default of 5 so a 6+ worker burst doesn't get TCP-RST'd at `accept()`.
+
+| Env | Default | Purpose |
+|---|---|---|
+| `HASHHARNESS_MAX_INFLIGHT` | `64` | concurrent in-flight cap on `/mcp`; `0` disables |
+| `HASHHARNESS_RETRY_AFTER_SECONDS` | `1` | value of the `Retry-After` header on 503 |
+| `HASHHARNESS_HTTP_BACKLOG` | `128` | TCP listen backlog (was stdlib default 5) |
+
 ## Turnkey setup for Codex and Claude Code
 
 This repo now includes checked-in example MCP configs for both clients:

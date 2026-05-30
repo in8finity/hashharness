@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from hashharness.storage import BaseTextStore, StorageError, TextStore, make_store
+
+
+# Sentinel value returned by _try_acquire_inflight when the cap is reached.
+_OVERLOAD = object()
 
 
 ITEM_FIELD_NAMES = {
@@ -630,10 +635,29 @@ class StdioMCPServer:
 
 
 class HttpMCPServer:
-    def __init__(self, app: MCPApplication, host: str, port: int) -> None:
+    def __init__(
+        self,
+        app: MCPApplication,
+        host: str,
+        port: int,
+        *,
+        max_inflight: int = 64,
+        retry_after_seconds: int = 1,
+        listen_backlog: int = 128,
+    ) -> None:
         self.app = app
         self.host = host
         self.port = port
+        # 0 disables the inflight cap (clients see no 503 backpressure).
+        # Otherwise BoundedSemaphore enforces it across all request threads.
+        self.max_inflight = max(0, int(max_inflight))
+        self.retry_after_seconds = max(0, int(retry_after_seconds))
+        self.listen_backlog = max(1, int(listen_backlog))
+        self._inflight = (
+            threading.BoundedSemaphore(self.max_inflight)
+            if self.max_inflight > 0
+            else None
+        )
 
     def handle_http_request(
         self,
@@ -647,6 +671,8 @@ class HttpMCPServer:
 
         if method == "GET":
             if path == "/health":
+                # Always cheap; never backpressured — useful for liveness
+                # checks during overload.
                 return self._json_response(HTTPStatus.OK, {"ok": True})
             return self._json_response(
                 HTTPStatus.METHOD_NOT_ALLOWED,
@@ -679,10 +705,44 @@ class HttpMCPServer:
                 {"error": "Request body must be valid JSON"},
             )
 
-        response = self.app.handle_message(request)
+        # Inflight backpressure: if every slot is taken, return 503 +
+        # Retry-After so the client backs off cleanly instead of piling
+        # another concurrent request onto a contended writer (which the
+        # old behaviour surfaced as ConnectionResetError [Errno 54]).
+        token = self._try_acquire_inflight()
+        if token is _OVERLOAD:
+            return (
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "Content-Type": "application/json",
+                    "Retry-After": str(self.retry_after_seconds),
+                },
+                json.dumps(
+                    {
+                        "error": "server overloaded",
+                        "retry_after_seconds": self.retry_after_seconds,
+                    }
+                ).encode("utf-8"),
+            )
+        try:
+            response = self.app.handle_message(request)
+        finally:
+            self._release_inflight(token)
+
         if response is None:
             return HTTPStatus.ACCEPTED, {"Content-Length": "0"}, b""
         return self._json_response(HTTPStatus.OK, response)
+
+    def _try_acquire_inflight(self) -> object:
+        if self._inflight is None:
+            return None
+        if self._inflight.acquire(blocking=False):
+            return self._inflight
+        return _OVERLOAD
+
+    def _release_inflight(self, token: object) -> None:
+        if isinstance(token, threading.BoundedSemaphore):
+            token.release()
 
     def serve_forever(self) -> None:
         http_server = self
@@ -692,23 +752,36 @@ class HttpMCPServer:
             protocol_version = "HTTP/1.1"
 
             def do_POST(self) -> None:  # noqa: N802
+                # HTTP-level guard so any unhandled error returns a JSON 500
+                # to the client rather than aborting mid-stream and tearing
+                # the connection (which the client would see as Errno 54 /
+                # ConnectionResetError, indistinguishable from a real crash).
                 try:
-                    content_length = int(self.headers.get("Content-Length", "0"))
-                except ValueError:
-                    self._send_json(
-                        HTTPStatus.BAD_REQUEST,
-                        {"error": "Invalid Content-Length header"},
-                    )
-                    return
+                    try:
+                        content_length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "Invalid Content-Length header"},
+                        )
+                        return
 
-                body = self.rfile.read(content_length)
-                status, response_headers, response_body = http_server.handle_http_request(
-                    method="POST",
-                    path=self.path,
-                    headers={key: value for key, value in self.headers.items()},
-                    body=body,
-                )
-                self._send_response(status, response_headers, response_body)
+                    body = self.rfile.read(content_length)
+                    status, response_headers, response_body = http_server.handle_http_request(
+                        method="POST",
+                        path=self.path,
+                        headers={key: value for key, value in self.headers.items()},
+                        body=body,
+                    )
+                    self._send_response(status, response_headers, response_body)
+                except Exception as exc:  # pragma: no cover - last-ditch guardrail
+                    try:
+                        self._send_json(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "internal server error", "detail": str(exc)},
+                        )
+                    except Exception:
+                        pass
 
             def do_GET(self) -> None:  # noqa: N802
                 status, response_headers, response_body = http_server.handle_http_request(
@@ -741,6 +814,11 @@ class HttpMCPServer:
                 if response_body:
                     self.wfile.write(response_body)
 
+        # request_queue_size is the listen(backlog) socket parameter — the
+        # OS-level accept queue. The stdlib default is 5; under a 6-worker
+        # burst that produces TCP RST (ECONNRESET / Errno 54) on whichever
+        # connects don't fit. Configurable; default 128.
+        ThreadingHTTPServer.request_queue_size = self.listen_backlog
         with ThreadingHTTPServer((self.host, self.port), Handler) as server:
             server.serve_forever()
 
@@ -781,7 +859,16 @@ def main() -> None:
     if transport == "http":
         host = os.environ.get("HASHHARNESS_HTTP_HOST", "127.0.0.1")
         port = int(os.environ.get("HASHHARNESS_HTTP_PORT", "8000"))
-        HttpMCPServer(app, host, port).serve_forever()
+        HttpMCPServer(
+            app,
+            host,
+            port,
+            max_inflight=int(os.environ.get("HASHHARNESS_MAX_INFLIGHT", "64")),
+            retry_after_seconds=int(
+                os.environ.get("HASHHARNESS_RETRY_AFTER_SECONDS", "1")
+            ),
+            listen_backlog=int(os.environ.get("HASHHARNESS_HTTP_BACKLOG", "128")),
+        ).serve_forever()
         return
     raise SystemExit(f"Unsupported HASHHARNESS_MCP_TRANSPORT: {transport}")
 

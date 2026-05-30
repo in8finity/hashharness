@@ -1478,6 +1478,82 @@ class HttpMCPServerTests(unittest.TestCase):
         return int(status), body
 
 
+class HttpBackpressureTests(unittest.TestCase):
+    """503 + Retry-After when the inflight cap is reached; cap defaults; bypass for /health."""
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.wall = AdvancingClock()
+        self.store = TextStore(self.tempdir.name, now_fn=self.wall)
+        self.app = MCPApplication(self.store)
+
+    def tearDown(self) -> None:
+        self.store.flush_writes()
+        self.tempdir.cleanup()
+
+    def _server(self, **kw) -> HttpMCPServer:
+        return HttpMCPServer(self.app, "127.0.0.1", 8000, **kw)
+
+    def _post_ping(self, server: HttpMCPServer) -> tuple[int, dict[str, str], bytes]:
+        return server.handle_http_request(
+            method="POST",
+            path="/mcp",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}
+            ).encode(),
+        )
+
+    def test_inflight_cap_returns_503_with_retry_after(self) -> None:
+        server = self._server(max_inflight=2, retry_after_seconds=7)
+        # Pre-occupy every slot. We don't have an in-flight worker to compete
+        # against in a single-threaded test, so we just exhaust the semaphore
+        # directly — the handler's try-acquire path is what we're testing.
+        server._inflight.acquire()
+        server._inflight.acquire()
+        try:
+            status, headers, body = self._post_ping(server)
+        finally:
+            server._inflight.release()
+            server._inflight.release()
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["Retry-After"], "7")
+        payload = json.loads(body.decode())
+        self.assertEqual(payload["error"], "server overloaded")
+        self.assertEqual(payload["retry_after_seconds"], 7)
+
+    def test_inflight_slot_released_after_request(self) -> None:
+        server = self._server(max_inflight=1)
+        # Repeated serial requests must succeed — the semaphore must release
+        # in a finally so a tool exception doesn't leak slots.
+        for _ in range(5):
+            status, _, body = self._post_ping(server)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body.decode())["result"], {})
+
+    def test_health_endpoint_bypasses_backpressure(self) -> None:
+        server = self._server(max_inflight=1)
+        server._inflight.acquire()
+        try:
+            status, _, body = server.handle_http_request(method="GET", path="/health")
+        finally:
+            server._inflight.release()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode()), {"ok": True})
+
+    def test_cap_disabled_means_no_503(self) -> None:
+        server = self._server(max_inflight=0)
+        self.assertIsNone(server._inflight)
+        status, _, body = self._post_ping(server)
+        self.assertEqual(status, 200)
+
+    def test_defaults_are_sensible(self) -> None:
+        server = self._server()
+        self.assertEqual(server.max_inflight, 64)
+        self.assertEqual(server.retry_after_seconds, 1)
+        self.assertEqual(server.listen_backlog, 128)
+
+
 class SqliteTextStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
