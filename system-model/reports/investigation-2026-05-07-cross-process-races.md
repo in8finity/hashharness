@@ -119,12 +119,11 @@ Defensive check in `_validate_datetime`. Verified to fire on tz-naive tampered s
 
 ### Orphan rows after losing race
 
-For I5a/I4b/I1, the loser of a CAS race has its row persisted (via `_backend_persist_schema_version` / `_backend_insert_item_strict`) before the head CAS rejects. Result: storage retains an unreachable row that no chain walk visits. Not a fork (chain walks are linear) and `verify_chain` from a real root never visits these orphans. Cleanup options:
+For I5a/I4b/I1, the loser of a CAS race had its row persisted (via `_backend_persist_schema_version` / `_backend_insert_item_strict`) before the head CAS rejected. Result: storage retained an unreachable row that no chain walk visits. Not a fork (chain walks are linear) and `verify_chain` from a real root never visits these orphans.
 
-- Wrap persist + head-CAS in a single SQLite transaction (`BEGIN IMMEDIATE` + commit on CAS success, rollback on failure). Cross-backend symmetry for the FS layer requires deleting tmp/target on failure.
-- Add a periodic GC pass that reaps `schema_versions` rows not reachable from current head and `items` rows whose `record_sha256` isn't on any chain head's reachability set.
+**Status — sqlite path: fixed.** `create_item` now wraps strict-insert + head-CAS + tip-projection in `_backend_transaction()` (sqlite: `BEGIN IMMEDIATE` … `COMMIT/ROLLBACK`). A "head moved" raised by `_backend_set_head`'s conditional UPDATE bubbles up and triggers `ROLLBACK`, undoing the persisted item row. Regression test: `ItemChainCASRaceTests.test_sqlite_losing_racer_row_rolled_back_no_orphan`.
 
-Recommend the transaction approach if you care about storage tidiness; otherwise leave as-is — the integrity invariants are not affected.
+**Still open — filesystem path:** the FS backend's `_backend_transaction()` falls back to the base no-op, so a losing FS racer still leaves a tmp/target row. Closing this needs an FS-side compensating delete on CAS failure; lower priority since sqlite is the production backend. The schema-versions persist path also still writes before its CAS — same shape, same fix would apply.
 
 ### Schema chain integrity at verify time
 

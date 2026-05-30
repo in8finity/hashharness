@@ -2070,6 +2070,36 @@ class ItemChainCASRaceTests(unittest.TestCase):
             verifier = TextStore(td)
             self._assert_one_winner(out, head0, verifier)
 
+    def test_sqlite_losing_racer_row_rolled_back_no_orphan(self) -> None:
+        # R-7 closure: the CAS-losing racer's INSERT was being persisted
+        # before its head-CAS failed, leaving an unreachable row in items.
+        # With _backend_transaction wrapping insert + set_head, the ROLLBACK
+        # undoes the insert. After the race, items contains only the genesis
+        # row plus the winner's row — no orphan from the loser.
+        with TemporaryDirectory() as td:
+            db = Path(td) / "h.sqlite"
+            out, head0 = self._race(SqliteTextStore, db)
+            verifier = SqliteTextStore(db)
+            try:
+                self._assert_one_winner(out, head0, verifier)
+                with verifier.db_lock:
+                    rows = verifier.conn.execute(
+                        "SELECT record_sha256 FROM items WHERE work_package_id = ? "
+                        "ORDER BY text_sha256",
+                        ("wp-1",),
+                    ).fetchall()
+                stored = {r[0] for r in rows}
+                winner = next(
+                    v["record_sha256"]
+                    for v in out.values()
+                    if not isinstance(v, StorageError)
+                )
+                # Exactly genesis + winner — nothing from the loser.
+                self.assertEqual(stored, {head0, winner})
+                self.assertEqual(len(rows), 2)
+            finally:
+                verifier.close()
+
 
 class SchemaPinningTests(unittest.TestCase):
     """I5c: create_item must validate against the same schema version it stamps."""

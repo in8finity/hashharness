@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,6 +83,16 @@ class BaseTextStore:
     # ------------------------------------------------------------------ backend
     def _init_backend(self) -> None:
         raise NotImplementedError
+
+    @contextmanager
+    def _backend_transaction(self) -> Iterator[None]:
+        """Atomic write group. Backends with a transaction primitive (sqlite)
+        wrap the body in BEGIN IMMEDIATE … COMMIT/ROLLBACK so insert + head
+        CAS + tip projection commit as one unit (closing the orphan-on-CAS-
+        loss class). Backends without one fall through — the existing
+        per-statement guarantees still apply, but a CAS loss may leave an
+        unreachable persisted row, same as today."""
+        yield
 
     def _backend_get_schema_head(self) -> str | None:
         raise NotImplementedError
@@ -400,22 +411,28 @@ class BaseTextStore:
                     work_package_id, item_type, predecessor_rule, validated_links
                 )
 
-            # Synchronous strict insert closes the cross-process / cross-
-            # instance race: cache_lock + _backend_read_item is per-instance
-            # only. The backend MUST give an atomic CAS guarantee here.
-            self._backend_insert_item_strict(item)
+            # Strict insert + head-CAS + tip-projection run in one backend
+            # transaction (sqlite: BEGIN IMMEDIATE … COMMIT/ROLLBACK; base /
+            # filesystem: no-op fallback). A failure anywhere — including a
+            # "head moved" raised by `_backend_set_head`'s conditional UPDATE
+            # — rolls back the persisted row, closing the orphan-on-CAS-loss
+            # class. Fewer writer-lock acquisitions per create also reduce
+            # cross-process contention.
+            with self._backend_transaction():
+                self._backend_insert_item_strict(item)
+                if predecessor_rule is not None:
+                    supplied_prev = validated_links.get(predecessor_rule.name)
+                    self._set_head(
+                        work_package_id,
+                        item_type,
+                        item["record_sha256"],
+                        expected_prev=supplied_prev,
+                        attributes=item["attributes"],
+                    )
+
+            # Cache only after commit so a rolled-back insert doesn't leak
+            # into the per-instance cache.
             self._cache_item(item)
-
-            if predecessor_rule is not None:
-                supplied_prev = validated_links.get(predecessor_rule.name)
-                self._set_head(
-                    work_package_id,
-                    item_type,
-                    item["record_sha256"],
-                    expected_prev=supplied_prev,
-                    attributes=item["attributes"],
-                )
-
             return item
 
     def find_items(
@@ -1781,6 +1798,30 @@ class SqliteTextStore(BaseTextStore):
                         (record_sha256, text_sha256),
                     )
 
+    @contextmanager
+    def _backend_transaction(self) -> Iterator[None]:
+        # BEGIN IMMEDIATE takes the sqlite RESERVED lock straight away so
+        # insert + head-CAS UPDATE + tip-projection write run as one atomic
+        # group. A failure anywhere (e.g. _backend_set_head raising "head
+        # moved" on a 0-row UPDATE) bubbles up here and triggers ROLLBACK,
+        # so the persisted item row is undone — closing R-7
+        # (orphan-on-CAS-loss). db_lock is an RLock so inner statements that
+        # take it nest cleanly.
+        with self.db_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                try:
+                    self.conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            else:
+                self.conn.execute("COMMIT")
+                # Safe to checkpoint here — no open transaction.
+                self._maybe_checkpoint()
+
     def _maybe_checkpoint(self) -> None:
         # Call after a committed record write. Every wal_checkpoint_writes
         # records, fold the WAL back into the db and truncate the file.
@@ -1983,6 +2024,9 @@ class SqliteTextStore(BaseTextStore):
         self._maybe_checkpoint()
 
     def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
+        # This runs inside _backend_transaction(); the checkpoint trigger is
+        # moved to that wrapper because PRAGMA wal_checkpoint cannot execute
+        # inside an open write transaction.
         payload = json.dumps(item, sort_keys=True, ensure_ascii=False)
         with self.db_lock:
             cur = self.conn.execute(
@@ -1996,7 +2040,6 @@ class SqliteTextStore(BaseTextStore):
                 ),
             )
             if cur.rowcount == 1:
-                self._maybe_checkpoint()
                 return
             row = self.conn.execute(
                 "SELECT payload FROM items WHERE text_sha256 = ?",
