@@ -115,6 +115,38 @@ class MCPApplication:
             if return_mode == "full":
                 return self._tool_result(result)
             raise StorageError("create_item return must be one of: minimal, full")
+        if name == "submit_report_and_finish":
+            for section in ("report", "status"):
+                spec = arguments.get(section)
+                if not isinstance(spec, dict):
+                    raise StorageError(
+                        f"submit_report_and_finish: `{section}` must be an object"
+                    )
+                if "created_at" in spec:
+                    raise StorageError(
+                        f"submit_report_and_finish: `{section}.created_at` is "
+                        "server-stamped and cannot be supplied by the caller"
+                    )
+            result = self.store.submit_report_and_finish(
+                work_package_id=arguments["work_package_id"],
+                report=arguments["report"],
+                status=arguments["status"],
+            )
+            return_mode = arguments.get("return", "minimal")
+            if return_mode == "minimal":
+                return self._tool_result({
+                    "report": self._project_item(
+                        result["report"], ["text_sha256", "record_sha256"]
+                    ),
+                    "status": self._project_item(
+                        result["status"], ["text_sha256", "record_sha256"]
+                    ),
+                })
+            if return_mode == "full":
+                return self._tool_result(result)
+            raise StorageError(
+                "submit_report_and_finish return must be one of: minimal, full"
+            )
         if name == "find_items":
             result = self.store.find_items(
                 query=arguments.get("query"),
@@ -329,6 +361,54 @@ class MCPApplication:
                         "title",
                         "text",
                     ],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "submit_report_and_finish",
+                "description": (
+                    "Append a TaskReport and a terminal TaskStatus in ONE backend "
+                    "transaction (one writer-lock acquisition instead of two). Both "
+                    "items must belong to the same work_package_id. The server "
+                    "injects `proof=<new report.record_sha256>` into "
+                    "status.links, so the caller must OMIT it. Both chains' "
+                    "chain_predecessor CAS runs under the shared transaction — a "
+                    "failure in either rolls both back, so a TaskStatus without "
+                    "its proof TaskReport is impossible. Not idempotent: replay "
+                    "with the same text sha256 fails loudly."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "work_package_id": {"type": "string"},
+                        "report": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "text": {"type": "string"},
+                                "attributes": {"type": "object"},
+                                "links": {"type": "object"},
+                            },
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                        "status": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "text": {"type": "string"},
+                                "attributes": {"type": "object"},
+                                "links": {"type": "object"},
+                            },
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                        "return": {
+                            "type": "string",
+                            "enum": ["minimal", "full"],
+                        },
+                    },
+                    "required": ["work_package_id", "report", "status"],
                     "additionalProperties": False,
                 },
             },

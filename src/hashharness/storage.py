@@ -435,6 +435,209 @@ class BaseTextStore:
             self._cache_item(item)
             return item
 
+    def submit_report_and_finish(
+        self,
+        *,
+        work_package_id: str,
+        report: dict[str, Any],
+        status: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append a TaskReport and a terminal TaskStatus in ONE backend
+        transaction (one writer-lock acquisition instead of two).
+
+        `report` and `status` are item specs: {title, text, attributes?,
+        links?}. The server injects `proof=<new report.record_sha256>`
+        into `status.links` before validation, so the client doesn't
+        need to predict the report's server-generated `created_at`.
+
+        Both items must belong to the same `work_package_id`. Both chains
+        (TaskReport, TaskStatus) run their normal `chain_predecessor` CAS
+        under the shared transaction — a failure in either rolls both
+        back, so a TaskStatus without its proof TaskReport is impossible.
+
+        Returns {"report": <item>, "status": <item>} on success.
+
+        Why this exists: `pm finished` used to do two `create_item` calls
+        (report append, terminal status append), taking two writer-lock
+        acquisitions per task-finish. Under N-way worker fan-out on
+        sqlite, that halved effective drain throughput. Coalescing them
+        cuts writer-lock acquisitions per finished task from 2 to 1.
+        """
+        schema_head = self._backend_get_schema_head()
+        if schema_head is None:
+            raise StorageError(
+                "No schema set; call set_schema before submit_report_and_finish"
+            )
+        schema = self.get_schema(at=schema_head)
+
+        report_rules = self._rules_for_type(schema, "TaskReport")
+        status_rules = self._rules_for_type(schema, "TaskStatus")
+
+        # Build the TaskReport item deterministically so we know its
+        # record_sha256 before opening the transaction; the TaskStatus
+        # will reference it via `proof`.
+        report_item = self._build_item_for_type(
+            schema_head=schema_head,
+            rules=report_rules,
+            item_type="TaskReport",
+            title=report.get("title", ""),
+            text=report["text"],
+            work_package_id=work_package_id,
+            attributes=report.get("attributes"),
+            links=report.get("links") or {},
+        )
+
+        status_links = dict(status.get("links") or {})
+        # Server owns the intra-transaction link: caller must not supply
+        # `proof` themselves (would ignore the newly-inserted report).
+        if "proof" in status_links and status_links["proof"] is not None:
+            raise StorageError(
+                "submit_report_and_finish: status.links.proof is server-managed; "
+                "omit it — the new report's record_sha256 is injected here"
+            )
+        status_links["proof"] = report_item["record_sha256"]
+        status_item = self._build_item_for_type(
+            schema_head=schema_head,
+            rules=status_rules,
+            item_type="TaskStatus",
+            title=status.get("title", ""),
+            text=status["text"],
+            work_package_id=work_package_id,
+            attributes=status.get("attributes"),
+            links=status_links,
+            pending_link_targets={report_item["record_sha256"]: report_item},
+        )
+
+        report_predecessor = self._chain_predecessor_rule(report_rules)
+        status_predecessor = self._chain_predecessor_rule(status_rules)
+
+        with self.cache_lock:
+            # Duplicate check for both items BEFORE opening the txn so
+            # a repeat-of-same insert short-circuits without touching
+            # the writer lock. Divergent duplicates (same text_sha256,
+            # different meta) fail loudly here as usual.
+            for item in (report_item, status_item):
+                cached = self._get_cached_item(item["text_sha256"])
+                if cached is not None:
+                    if not self._same_item(cached, item):
+                        raise StorageError(
+                            "An item with the same text sha256 already exists "
+                            "and cannot be updated"
+                        )
+                    # Idempotent replay: reject rather than silently succeed —
+                    # partial replay (one committed, one not) would produce
+                    # ambiguous semantics. Callers must retry from scratch.
+                    raise StorageError(
+                        "submit_report_and_finish: report or status already exists; "
+                        "this operation is not idempotent — retry with a distinct nonce"
+                    )
+                existing = self._backend_read_item(item["text_sha256"])
+                if existing is not None:
+                    raise StorageError(
+                        "submit_report_and_finish: report or status already exists; "
+                        "this operation is not idempotent — retry with a distinct nonce"
+                    )
+
+            if report_predecessor is not None:
+                self._enforce_head_compare_and_swap(
+                    work_package_id, "TaskReport",
+                    report_predecessor, report_item["links"],
+                )
+            if status_predecessor is not None:
+                self._enforce_head_compare_and_swap(
+                    work_package_id, "TaskStatus",
+                    status_predecessor, status_item["links"],
+                )
+
+            with self._backend_transaction():
+                self._backend_insert_item_strict(report_item)
+                if report_predecessor is not None:
+                    self._set_head(
+                        work_package_id, "TaskReport",
+                        report_item["record_sha256"],
+                        expected_prev=report_item["links"].get(
+                            report_predecessor.name
+                        ),
+                        attributes=report_item["attributes"],
+                    )
+                self._backend_insert_item_strict(status_item)
+                if status_predecessor is not None:
+                    self._set_head(
+                        work_package_id, "TaskStatus",
+                        status_item["record_sha256"],
+                        expected_prev=status_item["links"].get(
+                            status_predecessor.name
+                        ),
+                        attributes=status_item["attributes"],
+                    )
+
+            self._cache_item(report_item)
+            self._cache_item(status_item)
+
+        return {"report": report_item, "status": status_item}
+
+    def _build_item_for_type(
+        self,
+        *,
+        schema_head: str,
+        rules: dict[str, "LinkRule"],
+        item_type: str,
+        title: str,
+        text: str,
+        work_package_id: str,
+        attributes: dict[str, Any] | None,
+        links: dict[str, Any],
+        pending_link_targets: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Item-dict factory shared by `submit_report_and_finish` (and
+        potentially other multi-item verbs). Computes every content
+        hash + schema binding, mirroring `create_item`'s pre-insert
+        section, but does NOT touch the cache or the transaction.
+
+        ``pending_link_targets`` (record_sha256 -> item dict) makes
+        this item's link validation resolve against not-yet-inserted
+        siblings — required when the caller is coalescing multiple
+        writes and one item's link references another's record_sha256.
+        """
+        text_hash = sha256_text(text)
+        validated_links = self._validate_links(
+            rules, links, pending=pending_link_targets
+        )
+        normalized_created_at = self._validate_datetime(self.now_fn().isoformat())
+        validated_attributes = self._validate_attributes(attributes)
+        meta_sha256 = self._meta_sha256(
+            item_type=item_type,
+            work_package_id=work_package_id,
+            created_at=normalized_created_at,
+            title=title,
+            attributes=validated_attributes,
+        )
+        links_sha256 = sha256_json(validated_links)
+        record_sha = self._record_sha256(
+            text_sha256=text_hash,
+            meta_sha256=meta_sha256,
+            links_sha256=links_sha256,
+        )
+        binding_sha = self._schema_binding_sha256(
+            record_sha256=record_sha,
+            schema_sha256=schema_head,
+        )
+        return {
+            "type": item_type,
+            "text_sha256": text_hash,
+            "meta_sha256": meta_sha256,
+            "links_sha256": links_sha256,
+            "record_sha256": record_sha,
+            "schema_sha256": schema_head,
+            "schema_binding_sha256": binding_sha,
+            "work_package_id": work_package_id,
+            "created_at": normalized_created_at,
+            "title": title,
+            "attributes": validated_attributes,
+            "text": text,
+            "links": validated_links,
+        }
+
     def find_items(
         self,
         *,
@@ -939,8 +1142,18 @@ class BaseTextStore:
         )
 
     def _validate_links(
-        self, rules: dict[str, LinkRule], links: dict[str, Any]
+        self, rules: dict[str, LinkRule], links: dict[str, Any],
+        *, pending: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """Validate a link map against rules.
+
+        ``pending`` is an optional map of ``record_sha256 -> item dict``
+        for items that haven't been inserted yet but will land in the
+        same backend transaction (e.g. the TaskReport being coalesced
+        with a TaskStatus via ``submit_report_and_finish``). A link
+        target that appears in ``pending`` is treated as if it were
+        already stored — its ``type`` is checked against ``rule.target_types``
+        the same way as a persisted target."""
         if not isinstance(links, dict):
             raise StorageError("links must be an object")
 
@@ -960,14 +1173,14 @@ class BaseTextStore:
             if rule.kind == "single":
                 if not isinstance(value, str):
                     raise StorageError(f"Link {name} must be a sha256 string")
-                self._validate_target(name, value, rule)
+                self._validate_target(name, value, rule, pending=pending)
                 validated[name] = value
                 continue
 
             if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
                 raise StorageError(f"Link {name} must be a list of sha256 strings")
             for entry in value:
-                self._validate_target(name, entry, rule)
+                self._validate_target(name, entry, rule, pending=pending)
             validated[name] = value
             validated[f"{name}Hash"] = sha256_joined(value)
 
@@ -1136,10 +1349,17 @@ class BaseTextStore:
             pass
         return head
 
-    def _validate_target(self, link_name: str, record_sha256: str, rule: LinkRule) -> None:
+    def _validate_target(
+        self, link_name: str, record_sha256: str, rule: LinkRule,
+        *, pending: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", record_sha256):
             raise StorageError(f"Link {link_name} contains an invalid sha256: {record_sha256}")
-        target = self._resolve_record_sha256(record_sha256)
+        target: dict[str, Any] | None = None
+        if pending is not None:
+            target = pending.get(record_sha256)
+        if target is None:
+            target = self._resolve_record_sha256(record_sha256)
         if target is None:
             raise StorageError(
                 f"Link {link_name} target not found for record_sha256={record_sha256}"
