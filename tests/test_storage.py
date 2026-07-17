@@ -78,6 +78,26 @@ class TextStoreTests(unittest.TestCase):
         self.assertIn("links_sha256", fetched)
         self.assertIn("record_sha256", fetched)
 
+    def test_get_item_by_record_sha256_resolves_divergent_hashes(self) -> None:
+        # Non-empty attributes ⇒ record_sha256 ≠ text_sha256; the resolver has
+        # to route through the indexed lookup, not through get_item.
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="lab note w/ meta",
+            title="Evidence R",
+            work_package_id="wp-1",
+            attributes={"author": "alice"},
+        )
+        self.assertNotEqual(item["text_sha256"], item["record_sha256"])
+        resolved = self.store.get_item_by_record_sha256(item["record_sha256"])
+        self.assertEqual(resolved["text_sha256"], item["text_sha256"])
+        self.assertEqual(resolved["record_sha256"], item["record_sha256"])
+
+    def test_get_item_by_record_sha256_missing_raises(self) -> None:
+        with self.assertRaises(StorageError) as ctx:
+            self.store.get_item_by_record_sha256("0" * 64)
+        self.assertIn("Item not found for record_sha256", str(ctx.exception))
+
     def test_create_item_persists_attributes(self) -> None:
         item = self.store.create_item(
             item_type="Evidence",
@@ -964,6 +984,54 @@ class HttpMCPServerTests(unittest.TestCase):
         self.assertIn("get_work_package", {tool["name"] for tool in tools["result"]["tools"]})
         self.assertIn("find_tip", {tool["name"] for tool in tools["result"]["tools"]})
         self.assertIn("find_tips_bulk", {tool["name"] for tool in tools["result"]["tools"]})
+        self.assertIn(
+            "get_item_by_record_sha256",
+            {tool["name"] for tool in tools["result"]["tools"]},
+        )
+
+    def test_http_transport_get_item_by_record_sha256(self) -> None:
+        # The bug the ATAM adapter hit: resolving a link target by record_sha256
+        # was going through find_items(limit=10000) → misses records outside the
+        # first 10k of the untyped global page. The new MCP tool routes through
+        # the indexed resolver so this works regardless of store size or which
+        # work package the record lives in.
+        self.store.set_schema({"types": {"Evidence": {"links": {}}}})
+        item = self.store.create_item(
+            item_type="Evidence",
+            text="finding X",
+            title="F-X",
+            work_package_id="atam.case.demo",
+            attributes={"finding_type": "R", "severity": "high"},
+        )
+        self.assertNotEqual(item["text_sha256"], item["record_sha256"])
+        resp = self._post_json({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "get_item_by_record_sha256",
+                "arguments": {"record_sha256": item["record_sha256"]},
+            },
+        })
+        payload = resp["result"]["structuredContent"]
+        self.assertEqual(payload["text_sha256"], item["text_sha256"])
+        self.assertEqual(payload["record_sha256"], item["record_sha256"])
+        self.assertEqual(payload["attributes"]["finding_type"], "R")
+
+        # Missing hash surfaces as an isError tool response, not a JSON-RPC error.
+        missing = self._post_json({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "get_item_by_record_sha256",
+                "arguments": {"record_sha256": "0" * 64},
+            },
+        })
+        self.assertTrue(missing["result"]["isError"])
+        self.assertIn(
+            "record_sha256", missing["result"]["content"][0]["text"]
+        )
 
     def test_http_transport_runs_tool_calls(self) -> None:
         schema = {

@@ -305,6 +305,22 @@ class BaseTextStore:
             }
         )
 
+    def get_item_by_record_sha256(self, record_sha256: str) -> dict[str, Any]:
+        """Fetch one item by its record_sha256 (link id).
+
+        Distinct from get_item, which takes text_sha256 (storage key). The two
+        diverge whenever metadata is non-empty, so callers that hold a link
+        target — everything downstream of `create_item`'s return, every finding
+        sha, every ATAM/AIF cross-reference — must resolve through here rather
+        than paging find_items and grepping. Backed by the indexed
+        `_backend_find_item_by_record_sha256` (O(1) on sqlite via
+        `items_record_sha256`), so this is safe on stores of any size.
+        """
+        item = self._resolve_record_sha256(record_sha256)
+        if item is None:
+            raise StorageError(f"Item not found for record_sha256={record_sha256}")
+        return item
+
     def get_item(self, text_sha256: str) -> dict[str, Any]:
         self._evict_expired_work_packages()
         cached_item = self._get_cached_item(text_sha256)

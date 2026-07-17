@@ -161,6 +161,11 @@ class MCPApplication:
         if name == "get_item_by_hash":
             result = self.store.get_item(arguments["text_sha256"])
             return self._tool_result(result)
+        if name == "get_item_by_record_sha256":
+            result = self.store.get_item_by_record_sha256(
+                arguments["record_sha256"]
+            )
+            return self._tool_result(result)
         if name == "get_work_package":
             result = self.store.get_work_package(
                 arguments["work_package_id"],
@@ -450,6 +455,29 @@ class MCPApplication:
                         }
                     },
                     "required": ["text_sha256"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "get_item_by_record_sha256",
+                "description": (
+                    "Fetch one item by its record_sha256 (link id). Use this "
+                    "when you hold a link target — e.g. any sha returned from "
+                    "create_item, a finding_sha, an ATAM/AIF cross-reference — "
+                    "which is distinct from text_sha256 whenever metadata is "
+                    "non-empty. Backed by the indexed record_sha256 column so "
+                    "this stays O(1) regardless of store size; do NOT resolve "
+                    "record hashes by paging find_items."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "record_sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                        }
+                    },
+                    "required": ["record_sha256"],
                     "additionalProperties": False,
                 },
             },
