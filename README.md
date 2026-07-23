@@ -249,4 +249,4 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## License
 
-`CC BY-NC-SA 4.0`.
+MIT — see [LICENSE](LICENSE).
