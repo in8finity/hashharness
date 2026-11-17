@@ -8,6 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from hashharness.storage import BaseTextStore, StorageError, TextStore, make_store
 
@@ -175,6 +176,10 @@ class MCPApplication:
             if fields is not None:
                 result = {**result, "items": self._project_items(result["items"], fields)}
             return self._tool_result(result)
+        if name == "get_versions":
+            return self._tool_result(
+                {"versions": self.store.get_versions(arguments["prefixes"])}
+            )
         if name == "get_work_packages":
             ids = arguments["work_package_ids"]
             if not isinstance(ids, list):
@@ -527,6 +532,30 @@ class MCPApplication:
                         },
                     },
                     "required": ["work_package_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "get_versions",
+                "description": (
+                    "Cheap change tokens: one opaque token per work_package_id prefix "
+                    "(plain string prefix; \"\" = whole store), up to 100 per call. A "
+                    "token changes after every committed item write under its prefix and "
+                    "on every schema change; reads and failed writes leave it unchanged. "
+                    "Compare tokens for equality and skip a reload when they match. Under "
+                    "load, use GET /versions?prefix=… on the HTTP transport instead: it is "
+                    "not held behind the in-flight limit."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prefixes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 100,
+                        },
+                    },
+                    "required": ["prefixes"],
                     "additionalProperties": False,
                 },
             },
@@ -888,6 +917,16 @@ class HttpMCPServer:
                 # Always cheap; never backpressured — useful for liveness
                 # checks during overload.
                 return self._json_response(HTTPStatus.OK, {"ok": True})
+            parts = urlsplit(path)
+            if parts.path == "/versions":
+                # Change tokens for polling clients. Like /health it skips the
+                # in-flight limit: its purpose is to stop reloads under load.
+                prefixes = parse_qs(parts.query, keep_blank_values=True).get("prefix", [""])
+                try:
+                    versions = self.app.store.get_versions(prefixes)
+                except StorageError as exc:
+                    return self._json_response(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return self._json_response(HTTPStatus.OK, {"versions": versions})
             return self._json_response(
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 {"error": "Use POST /mcp for MCP requests"},

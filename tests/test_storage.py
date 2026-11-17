@@ -3401,5 +3401,249 @@ class BulkWorkPackageReadTests(unittest.TestCase):
         self.assertTrue(oversize["result"].get("isError"))
 
 
+
+class ChangeTokenTests(unittest.TestCase):
+    """get_versions: per-prefix change tokens (feedback change-token-requirements)."""
+
+    SCHEMA = {
+        "types": {
+            "Note": {"links": {}},
+            "S": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["S"],
+                        "chain_predecessor": True,
+                    }
+                }
+            },
+        }
+    }
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.db = f"{self.tempdir.name}/h.sqlite"
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _open(self):
+        return SqliteTextStore(self.db, now_fn=AdvancingClock())
+
+    def _note(self, store, wp, text):
+        return store.create_item(item_type="Note", text=text, title=text, work_package_id=wp)
+
+    def test_1_writes_move_only_their_prefixes(self) -> None:
+        for make in (self._open, lambda: TextStore(self.tempdir.name + "/fs", now_fn=AdvancingClock())):
+            with self.subTest(backend=make):
+                store = make()
+                try:
+                    store.set_schema(self.SCHEMA)
+                    self._note(store, "a:x", "1")
+                    self._note(store, "a:x", "2")
+                    self._note(store, "b:y", "3")
+                    before = store.get_versions(["a:", "b:", ""])
+                    self.assertEqual(set(before), {"a:", "b:", ""})
+                    self._note(store, "a:x", "4")
+                    after = store.get_versions(["a:", "b:", ""])
+                    self.assertNotEqual(after["a:"], before["a:"])
+                    self.assertNotEqual(after[""], before[""])
+                    self.assertEqual(after["b:"], before["b:"])
+                finally:
+                    getattr(store, "close", lambda: None)()
+
+    def test_prefixes_are_plain_string_prefixes(self) -> None:
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            self._note(store, "p:issue:a", "1")
+            before = store.get_versions(["p:issue:", "p:issue:a", "p:issue:a:", "p:issuf", "p:"])
+            self._note(store, "p:issue:a:b", "2")
+            after = store.get_versions(["p:issue:", "p:issue:a", "p:issue:a:", "p:issuf", "p:"])
+            for moved in ("p:issue:", "p:issue:a", "p:issue:a:", "p:"):
+                self.assertNotEqual(after[moved], before[moved], moved)
+            self.assertEqual(after["p:issuf"], before["p:issuf"])
+        finally:
+            store.close()
+
+    def test_2_failed_writes_move_nothing(self) -> None:
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            first = store.create_item(item_type="S", text="s1", title="s1", work_package_id="a:x")
+            before = store.get_versions(["a:", ""])
+            with self.assertRaises(StorageError):  # schema rejection
+                store.create_item(item_type="Unknown", text="u", title="u", work_package_id="a:x")
+            original = store._backend_index_tip
+            store._backend_index_tip = lambda *a, **k: (_ for _ in ()).throw(StorageError("boom"))
+            with self.assertRaises(StorageError):  # rollback inside the transaction
+                store.create_item(
+                    item_type="S", text="s2", title="s2", work_package_id="a:x",
+                    links={"prev": first["record_sha256"]},
+                )
+            store._backend_index_tip = original
+            self.assertEqual(store.get_versions(["a:", ""]), before)
+        finally:
+            store.close()
+
+    def test_3_schema_change_moves_every_token(self) -> None:
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            self._note(store, "a:x", "1")
+            before = store.get_versions(["a:", "b:", ""])
+            store.set_schema(
+                {"types": {**self.SCHEMA["types"], "Extra": {"links": {}}}},
+                expected_prev=store.get_schema_head(),
+            )
+            after = store.get_versions(["a:", "b:", ""])
+            for prefix in before:
+                self.assertNotEqual(after[prefix], before[prefix], prefix)
+        finally:
+            store.close()
+
+    def test_4_restart_keeps_tokens_and_other_process_writes_move_them(self) -> None:
+        import subprocess
+        import sys
+
+        store = self._open()
+        store.set_schema(self.SCHEMA)
+        self._note(store, "a:x", "1")
+        before = store.get_versions(["a:", "b:", ""])
+        store.close()
+
+        store = self._open()
+        try:
+            self.assertEqual(store.get_versions(["a:", "b:", ""]), before)
+            src = str(Path(__file__).resolve().parents[1] / "src")
+            subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]);"
+                 "from hashharness.storage import SqliteTextStore;"
+                 "s = SqliteTextStore(sys.argv[2]);"
+                 "s.create_item(item_type='Note', text='other', title='o', work_package_id='a:z');"
+                 "s.close()",
+                 src, self.db],
+                check=True,
+            )
+            after = store.get_versions(["a:", "b:", ""])
+            self.assertNotEqual(after["a:"], before["a:"])
+            self.assertEqual(after["b:"], before["b:"])
+        finally:
+            store.close()
+
+    def test_replaced_store_gives_different_tokens(self) -> None:
+        store = self._open()
+        store.set_schema(self.SCHEMA)
+        self._note(store, "a:x", "1")
+        before = store.get_versions(["a:"])
+        store.close()
+        Path(self.db).unlink()
+        for suffix in ("-wal", "-shm"):
+            Path(self.db + suffix).unlink(missing_ok=True)
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            self._note(store, "a:x", "1")
+            self.assertNotEqual(store.get_versions(["a:"]), before)
+        finally:
+            store.close()
+
+    def test_5_reads_move_nothing(self) -> None:
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            self._note(store, "a:x", "1")
+            before = store.get_versions(["a:", ""])
+            store.get_work_package("a:x")
+            store.get_work_packages(["a:x"])
+            store.find_tips_bulk(["a:x"], "Note")
+            store.list_work_packages()
+            store.verify_work_package("a:x")
+            store.checkpoint()
+            self.assertEqual(store.get_versions(["a:", ""]), before)
+        finally:
+            store.close()
+
+    def test_6_cheap_on_200k_items_and_loads_nothing(self) -> None:
+        import time
+
+        store = self._open()
+        store.set_schema(self.SCHEMA)
+        store.close()
+        # Seed 200 000 items directly: 20 prefixes x 100 work packages x 100 items.
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(self.db)
+        rows = (
+            (f"t{p:02d}{w:03d}{i:03d}", f"p{p:02d}:wp{w:03d}", None, "{}")
+            for p in range(20) for w in range(100) for i in range(100)
+        )
+        conn.executemany(
+            "INSERT INTO items (text_sha256, work_package_id, record_sha256, payload) "
+            "VALUES (?, ?, ?, ?)", rows,
+        )
+        # Pretend this database predates change tokens, to exercise the seeding.
+        conn.execute("DELETE FROM store_meta WHERE key = 'write_seq'")
+        conn.execute("DELETE FROM wp_versions")
+        conn.commit()
+        conn.close()
+
+        store = self._open()
+        try:
+            prefixes = [f"p{p:02d}:" for p in range(20)]
+            first = store.get_versions(prefixes)
+            self.assertEqual(len(set(first.values())), 20)
+            best = min(
+                self._timed(lambda: store.get_versions(prefixes), time) for _ in range(5)
+            )
+            self.assertLess(best, 0.002, f"get_versions took {best * 1000:.2f} ms")
+            self.assertEqual(store.work_package_cache, {})
+            self.assertLess(len(json.dumps({"versions": first})), 2048)
+        finally:
+            store.close()
+
+    @staticmethod
+    def _timed(fn, time) -> float:
+        start = time.perf_counter()
+        fn()
+        return time.perf_counter() - start
+
+    def test_7_http_endpoint_answers_while_inflight_exhausted(self) -> None:
+        store = self._open()
+        try:
+            store.set_schema(self.SCHEMA)
+            self._note(store, "a:x", "1")
+            server = HttpMCPServer(MCPApplication(store), "127.0.0.1", 8000, max_inflight=1)
+            server._inflight.acquire()
+            try:
+                status, _, body = server.handle_http_request(
+                    method="GET", path="/versions?prefix=a:&prefix=b:&prefix="
+                )
+            finally:
+                server._inflight.release()
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["versions"], store.get_versions(["a:", "b:", ""])
+            )
+            status, _, _ = server.handle_http_request(
+                method="GET", path="/versions?" + "&".join(["prefix=x"] * 101)
+            )
+            self.assertEqual(status, 200)  # duplicates collapse to one prefix
+            status, _, _ = server.handle_http_request(
+                method="GET",
+                path="/versions?" + "&".join(f"prefix=x{i}" for i in range(101)),
+            )
+            self.assertEqual(status, 400)
+            mcp = MCPApplication(store).handle_message(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": "get_versions", "arguments": {"prefixes": ["a:"]}}}
+            )
+            self.assertEqual(
+                _tool_payload(mcp["result"])["versions"], store.get_versions(["a:"])
+            )
+        finally:
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

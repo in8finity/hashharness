@@ -3,10 +3,12 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import queue
 import re
 import sqlite3
 import threading
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +40,21 @@ class CachedWorkPackage:
 def _chunked(values: list[str], size: int) -> Iterator[list[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _prefix_upper_bound(prefix: str) -> str | None:
+    """Smallest string greater than every string starting with prefix, in
+    code-point order (sqlite BINARY collation over UTF-8); None if unbounded."""
+    chars = list(prefix)
+    while chars:
+        code = ord(chars[-1]) + 1
+        if 0xD800 <= code <= 0xDFFF:
+            code = 0xE000
+        if code <= 0x10FFFF:
+            chars[-1] = chr(code)
+            return "".join(chars)
+        chars.pop()
+    return None
 
 
 def sha256_text(text: str) -> str:
@@ -128,6 +145,43 @@ class BaseTextStore:
                 self.heads.update(pending)
         finally:
             self._txn_state.pending_heads = None
+
+    MAX_VERSION_PREFIXES = 100
+
+    def get_versions(self, prefixes: list[str]) -> dict[str, str]:
+        """Change tokens, one per work-package-id prefix ("" = whole store).
+
+        A prefix's token changes after every committed item write to a work
+        package whose id starts with it (plain string prefix), and every
+        token changes on a schema change. Reads, cache loads, checkpoints,
+        verification and rolled-back writes leave tokens unchanged. Tokens
+        are opaque and compared for equality only; they come from the
+        backend, so they see other processes' writes and survive restarts,
+        and they mix in a per-store id so a replaced store never repeats
+        an old token. Loads no work package."""
+        if not isinstance(prefixes, list) or not all(isinstance(p, str) for p in prefixes):
+            raise StorageError("prefixes must be a list of strings")
+        unique = list(dict.fromkeys(prefixes))
+        if len(unique) > self.MAX_VERSION_PREFIXES:
+            raise StorageError(
+                f"prefixes exceeds maximum of {self.MAX_VERSION_PREFIXES} distinct per call"
+            )
+        store_id = self._backend_store_id()
+        schema_head = self._backend_get_schema_head() or ""
+        versions: dict[str, str] = {}
+        for prefix in unique:
+            seq = self._backend_prefix_seq(prefix)
+            versions[prefix] = hashlib.sha256(
+                f"{store_id}|{schema_head}|{seq}".encode("utf-8")
+            ).hexdigest()[:32]
+        return versions
+
+    def _backend_store_id(self) -> str:
+        raise NotImplementedError
+
+    def _backend_prefix_seq(self, prefix: str) -> str:
+        """A value that changes whenever an item is written under prefix."""
+        raise NotImplementedError
 
     def _backend_get_schema_head(self) -> str | None:
         raise NotImplementedError
@@ -1741,6 +1795,29 @@ class FilesystemTextStore(BaseTextStore):
         self.items_dir.mkdir(parents=True, exist_ok=True)
         self.schemas_dir.mkdir(parents=True, exist_ok=True)
 
+    def _backend_store_id(self) -> str:
+        path = self.root / "store_id"
+        if not path.exists():
+            tmp = path.with_name(f".store_id.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(uuid.uuid4().hex, encoding="utf-8")
+            try:
+                os.link(tmp, path)  # create-if-absent; a concurrent winner keeps its id
+            except FileExistsError:
+                pass
+            finally:
+                tmp.unlink(missing_ok=True)
+        return path.read_text(encoding="utf-8").strip()
+
+    def _backend_prefix_seq(self, prefix: str) -> str:
+        # No index on this backend: count the items under the prefix (items
+        # are append-only, so the count moves on every write). Correct but
+        # O(items); the sqlite backend is the fast path.
+        count = sum(
+            1 for item in self._backend_iter_items()
+            if str(item.get("work_package_id", "")).startswith(prefix)
+        )
+        return str(count)
+
     def _backend_legacy_schema_payload(self) -> dict[str, Any] | None:
         if not self.schema_path.exists():
             return None
@@ -2018,6 +2095,7 @@ class SqliteTextStore(BaseTextStore):
                 "CREATE INDEX IF NOT EXISTS items_record_sha256 "
                 "ON items(record_sha256)"
             )
+            self._init_versions_tables()
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_kv ("
                 "id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -2109,6 +2187,94 @@ class SqliteTextStore(BaseTextStore):
     ) -> None:
         with self.db_lock:
             self._index_tip_rows(work_package_id, item_type, record_sha256, attributes)
+
+    def _init_versions_tables(self) -> None:
+        # Change tokens (get_versions): a global write counter plus, per work
+        # package, the counter value of its latest write. Both are updated in
+        # the same statement group as the item write, so a rolled-back write
+        # leaves them untouched and other processes' writes are visible.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS store_meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS wp_versions ("
+            "work_package_id TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
+        )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO store_meta (key, value) VALUES ('store_id', ?)",
+            (uuid.uuid4().hex,),
+        )
+        has_seq = self.conn.execute(
+            "SELECT 1 FROM store_meta WHERE key = 'write_seq'"
+        ).fetchone()
+        if has_seq is None:
+            # New database, or one from before change tokens: seed from the
+            # items already stored (rowids are increasing and never reused,
+            # items being append-only).
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self.conn.execute(
+                    "SELECT 1 FROM store_meta WHERE key = 'write_seq'"
+                ).fetchone() is None:
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO wp_versions (work_package_id, seq) "
+                        "SELECT work_package_id, MAX(rowid) FROM items "
+                        "GROUP BY work_package_id"
+                    )
+                    self.conn.execute(
+                        "INSERT INTO store_meta (key, value) "
+                        "SELECT 'write_seq', CAST(COALESCE(MAX(rowid), 0) AS TEXT) FROM items"
+                    )
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+            else:
+                self.conn.execute("COMMIT")
+
+    def _bump_version(self, work_package_id: str) -> None:
+        # Caller holds db_lock. Inside _backend_transaction this is part of
+        # the atomic write; standalone (_persist_item) the two statements may
+        # interleave with another process's bump, which can only make two
+        # writes share a counter value — each still moves its prefix.
+        self.conn.execute(
+            "UPDATE store_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+            "WHERE key = 'write_seq'"
+        )
+        self.conn.execute(
+            "INSERT INTO wp_versions (work_package_id, seq) "
+            "SELECT ?, CAST(value AS INTEGER) FROM store_meta WHERE key = 'write_seq' "
+            "ON CONFLICT(work_package_id) DO UPDATE SET seq = excluded.seq",
+            (work_package_id,),
+        )
+
+    def _backend_store_id(self) -> str:
+        with self.db_lock:
+            row = self.conn.execute(
+                "SELECT value FROM store_meta WHERE key = 'store_id'"
+            ).fetchone()
+        return row[0]
+
+    def _backend_prefix_seq(self, prefix: str) -> str:
+        with self.db_lock:
+            if prefix == "":
+                row = self.conn.execute(
+                    "SELECT value FROM store_meta WHERE key = 'write_seq'"
+                ).fetchone()
+                return str(row[0] if row else 0)
+            upper = _prefix_upper_bound(prefix)
+            if upper is None:
+                row = self.conn.execute(
+                    "SELECT MAX(seq) FROM wp_versions WHERE work_package_id >= ?",
+                    (prefix,),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT MAX(seq) FROM wp_versions "
+                    "WHERE work_package_id >= ? AND work_package_id < ?",
+                    (prefix, upper),
+                ).fetchone()
+        return str(row[0] if row and row[0] is not None else 0)
 
     def _rebuild_tip_attributes(self) -> None:
         # One-time (or repair) rebuild from the authoritative heads table.
@@ -2400,6 +2566,7 @@ class SqliteTextStore(BaseTextStore):
                     payload,
                 ),
             )
+            self._bump_version(item["work_package_id"])
         self._maybe_checkpoint()
 
     def _backend_insert_item_strict(self, item: dict[str, Any]) -> None:
@@ -2419,6 +2586,7 @@ class SqliteTextStore(BaseTextStore):
                 ),
             )
             if cur.rowcount == 1:
+                self._bump_version(item["work_package_id"])
                 return
             row = self.conn.execute(
                 "SELECT payload FROM items WHERE text_sha256 = ?",
