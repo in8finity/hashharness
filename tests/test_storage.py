@@ -3025,5 +3025,169 @@ class TipAttributeFilterTests(unittest.TestCase):
             store.close()
 
 
+
+class HeadCacheRollbackTests(unittest.TestCase):
+    """A write that fails inside the backend transaction must not leave its
+    head in the in-memory cache (dangling head: cache points at a record that
+    was rolled back, so find_tip fails and every later append is refused)."""
+
+    SCHEMA = {
+        "types": {
+            "TaskReport": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["TaskReport"],
+                        "chain_predecessor": True,
+                    }
+                }
+            },
+            "TaskStatus": {
+                "links": {
+                    "prev": {
+                        "kind": "single",
+                        "target_types": ["TaskStatus"],
+                        "chain_predecessor": True,
+                    },
+                    "proof": {"kind": "single", "target_types": ["TaskReport"]},
+                }
+            },
+        }
+    }
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _make(self, backend: str):
+        if backend == "fs":
+            store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        else:
+            store = SqliteTextStore(
+                f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock()
+            )
+        store.set_schema(self.SCHEMA)
+        return store
+
+    def _append(self, store, wp: str, text: str, item_type: str = "TaskStatus"):
+        head = store._get_head(wp, item_type)
+        return store.create_item(
+            item_type=item_type,
+            text=text,
+            title=text,
+            work_package_id=wp,
+            links={} if head is None else {"prev": head},
+        )
+
+    def test_create_item_failure_after_head_cas_keeps_previous_head(self) -> None:
+        store = self._make("sqlite")
+        try:
+            first = self._append(store, "wp", "s1")
+            original = store._backend_index_tip
+
+            def boom(*args, **kwargs):
+                raise StorageError("injected tip-projection failure")
+
+            store._backend_index_tip = boom
+            with self.assertRaises(StorageError):
+                self._append(store, "wp", "s2")
+            store._backend_index_tip = original
+
+            self.assertEqual(store._get_head("wp", "TaskStatus"), first["record_sha256"])
+            self.assertEqual(
+                store.find_tip("wp", "TaskStatus")["record_sha256"],
+                first["record_sha256"],
+            )
+            second = self._append(store, "wp", "s2-retry")
+            self.assertEqual(second["links"]["prev"], first["record_sha256"])
+        finally:
+            store.close()
+
+    def test_failed_first_append_leaves_chain_empty(self) -> None:
+        store = self._make("sqlite")
+        try:
+            original = store._backend_index_tip
+            store._backend_index_tip = lambda *a, **k: (_ for _ in ()).throw(
+                StorageError("injected")
+            )
+            with self.assertRaises(StorageError):
+                self._append(store, "wp", "s1")
+            store._backend_index_tip = original
+
+            self.assertIsNone(store._get_head("wp", "TaskStatus"))
+            created = self._append(store, "wp", "s1-retry")
+            self.assertEqual(created["links"], {})
+        finally:
+            store.close()
+
+    def test_submit_report_and_finish_rollback_keeps_report_head(self) -> None:
+        store = self._make("sqlite")
+        try:
+            report0 = self._append(store, "wp", "r0", "TaskReport")
+            status0 = self._append(store, "wp", "s0")
+            original = store._backend_insert_item_strict
+
+            def fail_on_status(item):
+                if item["type"] == "TaskStatus":
+                    raise StorageError("injected status insert failure")
+                return original(item)
+
+            store._backend_insert_item_strict = fail_on_status
+            with self.assertRaises(StorageError):
+                store.submit_report_and_finish(
+                    work_package_id="wp",
+                    report={"text": "r1", "links": {"prev": report0["record_sha256"]}},
+                    status={"text": "s1", "links": {"prev": status0["record_sha256"]}},
+                )
+            store._backend_insert_item_strict = original
+
+            self.assertEqual(
+                store._get_head("wp", "TaskReport"), report0["record_sha256"]
+            )
+            result = store.submit_report_and_finish(
+                work_package_id="wp",
+                report={"text": "r1b", "links": {"prev": report0["record_sha256"]}},
+                status={"text": "s1b", "links": {"prev": status0["record_sha256"]}},
+            )
+            self.assertEqual(
+                store.find_tip("wp", "TaskReport")["record_sha256"],
+                result["report"]["record_sha256"],
+            )
+        finally:
+            store.close()
+
+    def test_find_tip_self_heals_stale_cached_head(self) -> None:
+        for backend in ("fs", "sqlite"):
+            with self.subTest(backend=backend):
+                self.tearDown()
+                self.setUp()
+                store = self._make(backend)
+                try:
+                    first = self._append(store, "wp", "s1")
+                    with store.cache_lock:
+                        store.heads[("wp", "TaskStatus")] = "0" * 64
+                    self.assertEqual(
+                        store.find_tip("wp", "TaskStatus")["record_sha256"],
+                        first["record_sha256"],
+                    )
+                    with store.cache_lock:
+                        store.heads[("wp", "TaskStatus")] = "0" * 64
+                    second = store.create_item(
+                        item_type="TaskStatus",
+                        text="s2",
+                        title="s2",
+                        work_package_id="wp",
+                        links={"prev": first["record_sha256"]},
+                    )
+                    self.assertEqual(
+                        store.find_tip("wp", "TaskStatus")["record_sha256"],
+                        second["record_sha256"],
+                    )
+                finally:
+                    getattr(store, "close", lambda: None)()
+
+
 if __name__ == "__main__":
     unittest.main()

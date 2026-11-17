@@ -70,6 +70,9 @@ class BaseTextStore:
         self.record_to_text_sha256: dict[str, str] = {}
         self.heads: dict[tuple[str, str], str] = {}
         self.cache_lock = threading.RLock()
+        # Per-thread head updates made inside an open _write_transaction.
+        # They reach self.heads only after COMMIT (see _write_transaction).
+        self._txn_state = threading.local()
         self.write_queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.pending_writes: set[str] = set()
         self.write_thread = threading.Thread(
@@ -93,6 +96,38 @@ class BaseTextStore:
         per-statement guarantees still apply, but a CAS loss may leave an
         unreachable persisted row, same as today."""
         yield
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """_backend_transaction plus a transactional head cache.
+
+        Head moves made inside the body are staged per thread and applied
+        to self.heads only after the backend commits. On any failure the
+        touched keys are dropped from the cache instead, so the next read
+        goes to the backend: after a ROLLBACK that is the previous head;
+        on a backend without real transactions it is whatever was actually
+        persisted. Without this, a rolled-back head stayed cached and was
+        served until restart (dangling head: find_tip "Head record not
+        found", every later append refused by the CAS)."""
+        if getattr(self._txn_state, "pending_heads", None) is not None:
+            # Nested: the outermost transaction owns commit/rollback.
+            yield
+            return
+        pending: dict[tuple[str, str], str] = {}
+        self._txn_state.pending_heads = pending
+        try:
+            with self._backend_transaction():
+                yield
+        except BaseException:
+            with self.cache_lock:
+                for key in pending:
+                    self.heads.pop(key, None)
+            raise
+        else:
+            with self.cache_lock:
+                self.heads.update(pending)
+        finally:
+            self._txn_state.pending_heads = None
 
     def _backend_get_schema_head(self) -> str | None:
         raise NotImplementedError
@@ -434,7 +469,7 @@ class BaseTextStore:
             # — rolls back the persisted row, closing the orphan-on-CAS-loss
             # class. Fewer writer-lock acquisitions per create also reduce
             # cross-process contention.
-            with self._backend_transaction():
+            with self._write_transaction():
                 self._backend_insert_item_strict(item)
                 if predecessor_rule is not None:
                     supplied_prev = validated_links.get(predecessor_rule.name)
@@ -565,7 +600,7 @@ class BaseTextStore:
                     status_predecessor, status_item["links"],
                 )
 
-            with self._backend_transaction():
+            with self._write_transaction():
                 self._backend_insert_item_strict(report_item)
                 if report_predecessor is not None:
                     self._set_head(
@@ -892,6 +927,18 @@ class BaseTextStore:
                     f"No items found for work_package_id={work_package_id} and type={item_type}"
                 )
             item = self._resolve_record_sha256(head)
+            if item is None:
+                # A cache hit must never outrank the backend: drop the
+                # cached head and re-read before declaring it dangling.
+                fresh = self._reload_head(work_package_id, item_type)
+                if fresh is None:
+                    raise StorageError(
+                        f"No items found for work_package_id={work_package_id} "
+                        f"and type={item_type}"
+                    )
+                if fresh != head:
+                    head = fresh
+                    item = self._resolve_record_sha256(head)
             if item is None:
                 raise StorageError(
                     f"Head record not found for work_package_id={work_package_id} "
@@ -1225,6 +1272,11 @@ class BaseTextStore:
     ) -> None:
         current_head = self._get_head(work_package_id, item_type)
         supplied_prev = validated_links.get(predecessor_rule.name)
+        if supplied_prev != current_head:
+            # Only on the refusal path: confirm against the backend so a
+            # stale cached head (another process moved it, or a leftover
+            # from a failed write) doesn't refuse a correct predecessor.
+            current_head = self._reload_head(work_package_id, item_type)
         if current_head is None:
             if supplied_prev is not None:
                 raise StorageError(
@@ -1245,6 +1297,9 @@ class BaseTextStore:
 
     def _get_head(self, work_package_id: str, item_type: str) -> str | None:
         key = (work_package_id, item_type)
+        pending = getattr(self._txn_state, "pending_heads", None)
+        if pending and key in pending:
+            return pending[key]
         with self.cache_lock:
             if key in self.heads:
                 return self.heads[key]
@@ -1254,6 +1309,12 @@ class BaseTextStore:
                 self.heads[key] = persisted
             return persisted
         return self._bootstrap_head(work_package_id, item_type)
+
+    def _reload_head(self, work_package_id: str, item_type: str) -> str | None:
+        """Drop the cached head and resolve it again from the backend."""
+        with self.cache_lock:
+            self.heads.pop((work_package_id, item_type), None)
+        return self._get_head(work_package_id, item_type)
 
     def _set_head(
         self,
@@ -1266,12 +1327,19 @@ class BaseTextStore:
     ) -> None:
         # Persist with cross-process CAS BEFORE updating the in-memory cache,
         # so a losing race leaves the cache untouched (and re-reads will refresh
-        # against the winner's head).
+        # against the winner's head). Inside a _write_transaction the persisted
+        # row can still be rolled back, so the cache update is only staged
+        # there and applied after COMMIT.
         self._backend_set_head(
             work_package_id, item_type, record_sha256, expected_prev=expected_prev
         )
-        with self.cache_lock:
-            self.heads[(work_package_id, item_type)] = record_sha256
+        key = (work_package_id, item_type)
+        pending = getattr(self._txn_state, "pending_heads", None)
+        if pending is not None:
+            pending[key] = record_sha256
+        else:
+            with self.cache_lock:
+                self.heads[key] = record_sha256
         # Maintain the tip-attribute projection (backends with one). The CAS
         # already committed the head; this is the only writer of the head, so
         # the projection follows the authoritative head.
