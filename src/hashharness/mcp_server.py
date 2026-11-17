@@ -737,9 +737,17 @@ class MCPApplication:
         ]
 
     def _tool_result(self, payload: Any) -> dict[str, Any]:
+        # One compact text copy only. The server negotiates protocol
+        # 2024-11-05 and no tool declares an outputSchema, so no client reads
+        # structuredContent; sending it (plus indent=2) made every answer
+        # ~2.5x its data. Keys stay sorted for stable output.
         return {
-            "content": [{"type": "text", "text": json.dumps(payload, indent=2, sort_keys=True)}],
-            "structuredContent": payload,
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                }
+            ]
         }
 
     def _project_items(

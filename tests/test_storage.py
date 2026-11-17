@@ -18,6 +18,11 @@ from hashharness.storage import (
 )
 
 
+def _tool_payload(result: dict) -> object:
+    """Decode a tools/call result: the payload is the JSON in content[0].text."""
+    return json.loads(result["content"][0]["text"])
+
+
 class AdvancingClock:
     """Deterministic wall clock for tests; advances 1 second per call."""
 
@@ -1013,7 +1018,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 "arguments": {"record_sha256": item["record_sha256"]},
             },
         })
-        payload = resp["result"]["structuredContent"]
+        payload = _tool_payload(resp["result"])
         self.assertEqual(payload["text_sha256"], item["text_sha256"])
         self.assertEqual(payload["record_sha256"], item["record_sha256"])
         self.assertEqual(payload["attributes"]["finding_type"], "R")
@@ -1078,7 +1083,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        evidence_hash = evidence["result"]["structuredContent"]["record_sha256"]
+        evidence_hash = _tool_payload(evidence["result"])["record_sha256"]
         current = self._post_json(
             {
                 "jsonrpc": "2.0",
@@ -1096,7 +1101,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        current_hash = current["result"]["structuredContent"]["text_sha256"]
+        current_hash = _tool_payload(current["result"])["text_sha256"]
 
         queried = self._post_json(
             {
@@ -1110,9 +1115,9 @@ class HttpMCPServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(queried["result"]["structuredContent"]["item_count"], 2)
+        self.assertEqual(_tool_payload(queried["result"])["item_count"], 2)
         self.assertEqual(
-            evidence["result"]["structuredContent"]["attributes"],
+            _tool_payload(evidence["result"])["attributes"],
             {"source": "lab"},
         )
 
@@ -1182,7 +1187,7 @@ class HttpMCPServerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            set(result["result"]["structuredContent"].keys()),
+            set(_tool_payload(result["result"]).keys()),
             {"record_sha256", "text_sha256"},
         )
 
@@ -1250,9 +1255,9 @@ class HttpMCPServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["result"]["structuredContent"]["items"][0]["title"], "Observation A")
+        self.assertEqual(_tool_payload(result["result"])["items"][0]["title"], "Observation A")
         self.assertEqual(
-            set(result["result"]["structuredContent"]["items"][0].keys()),
+            set(_tool_payload(result["result"])["items"][0].keys()),
             {"attributes", "text_sha256", "title"},
         )
 
@@ -1283,7 +1288,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        text_sha256 = created["result"]["structuredContent"]["text_sha256"]
+        text_sha256 = _tool_payload(created["result"])["text_sha256"]
 
         result = self._post_json(
             {
@@ -1298,7 +1303,7 @@ class HttpMCPServerTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            set(result["result"]["structuredContent"].keys()),
+            set(_tool_payload(result["result"]).keys()),
             {"checked_items", "errors_count", "ok", "root_text_sha256"},
         )
 
@@ -1359,9 +1364,9 @@ class HttpMCPServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["result"]["structuredContent"]["title"], "New")
+        self.assertEqual(_tool_payload(result["result"])["title"], "New")
         self.assertEqual(
-            set(result["result"]["structuredContent"].keys()),
+            set(_tool_payload(result["result"]).keys()),
             {"created_at", "record_sha256", "text_sha256", "title", "type"},
         )
 
@@ -1410,7 +1415,7 @@ class HttpMCPServerTests(unittest.TestCase):
             },
         )
 
-        tips = result["result"]["structuredContent"]["tips"]
+        tips = _tool_payload(result["result"])["tips"]
         self.assertEqual(tips["wp-a"]["title"], "A2")
         self.assertEqual(tips["wp-b"]["title"], "B1")
         self.assertIsNone(tips["wp-missing"])
@@ -1483,7 +1488,7 @@ class HttpMCPServerTests(unittest.TestCase):
                 },
             },
         )
-        evidence_hash = evidence["result"]["structuredContent"]["record_sha256"]
+        evidence_hash = _tool_payload(evidence["result"])["record_sha256"]
         self._post_json(
             {
                 "jsonrpc": "2.0",
@@ -1514,8 +1519,8 @@ class HttpMCPServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["result"]["structuredContent"]["item_count"], 1)
-        self.assertEqual(result["result"]["structuredContent"]["items"][0]["type"], "Evidence")
+        self.assertEqual(_tool_payload(result["result"])["item_count"], 1)
+        self.assertEqual(_tool_payload(result["result"])["items"][0]["type"], "Evidence")
 
     def test_http_transport_accepts_notifications(self) -> None:
         status, body = self._post_json_raw(
@@ -2692,16 +2697,16 @@ class VerifyWorkPackageTests(unittest.TestCase):
             store.create_item(item_type="Evidence", text="b", title="b", work_package_id="wp-2")
             store.flush_writes()
             app = MCPApplication(store)
-            listing = app._call_tool(
+            listing = _tool_payload(app._call_tool(
                 {"name": "list_work_packages", "arguments": {}}
-            )["structuredContent"]["work_package_ids"]
+            ))["work_package_ids"]
             self.assertEqual(listing, ["wp-1", "wp-2"])
-            out = app._call_tool(
+            out = _tool_payload(app._call_tool(
                 {
                     "name": "verify_work_package",
                     "arguments": {"work_package_ids": listing, "summary": True},
                 }
-            )["structuredContent"]
+            ))
             self.assertTrue(out["ok"])
             self.assertEqual(out["checked_work_packages"], 2)
         finally:
@@ -2900,7 +2905,7 @@ class TipProjectionTests(unittest.TestCase):
                     },
                 }
             )
-            tips = out["structuredContent"]["tips"]
+            tips = _tool_payload(out)["tips"]
             self.assertEqual(set(tips), {"wp-a"})
             self.assertEqual(tips["wp-a"]["title"], "new")
         finally:
@@ -3342,10 +3347,25 @@ class BulkWorkPackageReadTests(unittest.TestCase):
                 }
             )
             self.assertFalse(response["result"].get("isError"), response)
-            return response["result"]["structuredContent"]
+            return _tool_payload(response["result"])
 
         tools = app.handle_message({"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
         self.assertIn("get_work_packages", {t["name"] for t in tools["result"]["tools"]})
+
+        # Each answer carries the payload once, as compact JSON text.
+        raw = app.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_work_packages", "arguments": {}},
+            }
+        )["result"]
+        self.assertEqual(set(raw), {"content"})
+        text = raw["content"][0]["text"]
+        self.assertEqual(
+            text, json.dumps(json.loads(text), separators=(",", ":"), sort_keys=True)
+        )
 
         single = call(
             "get_work_package",
