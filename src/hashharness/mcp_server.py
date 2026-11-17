@@ -171,7 +171,30 @@ class MCPApplication:
                 arguments["work_package_id"],
                 item_type=arguments.get("type"),
             )
+            fields = arguments.get("fields")
+            if fields is not None:
+                result = {**result, "items": self._project_items(result["items"], fields)}
             return self._tool_result(result)
+        if name == "get_work_packages":
+            ids = arguments["work_package_ids"]
+            if not isinstance(ids, list):
+                raise StorageError("work_package_ids must be a list")
+            if len(ids) > 10000:
+                raise StorageError("work_package_ids exceeds maximum of 10000 per call")
+            packages = self.store.get_work_packages(
+                ids,
+                item_type=arguments.get("type"),
+                since=arguments.get("since"),
+            )
+            fields = arguments.get("fields")
+            if fields is not None:
+                packages = {
+                    wp_id: None if pkg is None else {
+                        **pkg, "items": self._project_items(pkg["items"], fields)
+                    }
+                    for wp_id, pkg in packages.items()
+                }
+            return self._tool_result({"work_packages": packages})
         if name == "find_tip":
             result = self.store.find_tip(
                 arguments["work_package_id"],
@@ -484,15 +507,61 @@ class MCPApplication:
             {
                 "name": "get_work_package",
                 "description": (
-                    "Return all records for one work_package_id, optionally filtered by item type."
+                    "Return all records for one work_package_id, optionally filtered by "
+                    "item type. Optional fields projects each item (dotted paths such "
+                    "as attributes.status select nested keys)."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "work_package_id": {"type": "string"},
                         "type": {"type": "string"},
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Projection per item. Omit for whole items. "
+                                "Dotted paths select nested keys, e.g. "
+                                "attributes.status."
+                            ),
+                        },
                     },
                     "required": ["work_package_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "get_work_packages",
+                "description": (
+                    "Batched form of get_work_package: every record of each given "
+                    "work_package_id in one call, as {work_packages: {id: {items, "
+                    "item_count} | null}}; ids with no records map to null. Up to "
+                    "10000 ids per call. Optional type filter, fields projection "
+                    "(dotted paths such as attributes.status), and since (ISO 8601 "
+                    "with timezone: only items created strictly after it). Use this "
+                    "instead of N get_work_package calls for history views."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "work_package_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 10000,
+                        },
+                        "type": {"type": "string"},
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Projection per item. Omit for whole items. "
+                                "Dotted paths select nested keys, e.g. "
+                                "attributes.status."
+                            ),
+                        },
+                        "since": {"type": "string"},
+                    },
+                    "required": ["work_package_ids"],
                     "additionalProperties": False,
                 },
             },
@@ -681,10 +750,39 @@ class MCPApplication:
         return [self._project_item(item, fields) for item in items]
 
     def _project_item(self, item: dict[str, Any], fields: list[str]) -> dict[str, Any]:
-        unknown = [field for field in fields if field not in ITEM_FIELD_NAMES]
+        # A field is a top-level item field or a dotted path into one
+        # (attributes.status, attributes.a.b). Missing paths are omitted.
+        # When both a path and one of its ancestors are requested, the
+        # ancestor wins (the whole value is returned once).
+        paths: list[tuple[str, ...]] = []
+        unknown: list[str] = []
+        for field in fields:
+            parts = tuple(field.split("."))
+            if parts[0] not in ITEM_FIELD_NAMES or any(not part for part in parts):
+                unknown.append(field)
+            else:
+                paths.append(parts)
         if unknown:
             raise StorageError(f"Unknown item fields requested: {', '.join(sorted(unknown))}")
-        return {field: item.get(field) for field in fields if field in item}
+        requested = set(paths)
+        projected: dict[str, Any] = {}
+        for parts in dict.fromkeys(paths):
+            if any(parts[:depth] in requested for depth in range(1, len(parts))):
+                continue
+            value: Any = item
+            found = True
+            for part in parts:
+                if not isinstance(value, dict) or part not in value:
+                    found = False
+                    break
+                value = value[part]
+            if not found:
+                continue
+            target = projected
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            target[parts[-1]] = value
+        return projected
 
     def _tool_error(self, request_id: Any, message: str) -> dict[str, Any]:
         return self._result(

@@ -3189,5 +3189,197 @@ class HeadCacheRollbackTests(unittest.TestCase):
                     getattr(store, "close", lambda: None)()
 
 
+
+class BulkWorkPackageReadTests(unittest.TestCase):
+    """get_work_packages (bulk whole-chain read) and dotted-path projection."""
+
+    SCHEMA = {"types": {"Evidence": {"links": {}}, "Note": {"links": {}}}}
+
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _make(self, backend: str, clock):
+        if backend == "fs":
+            store = TextStore(self.tempdir.name, now_fn=clock)
+        else:
+            store = SqliteTextStore(f"{self.tempdir.name}/h.sqlite", now_fn=clock)
+        store.set_schema(self.SCHEMA)
+        return store
+
+    def _add(self, store, wp, item_type, text, attributes=None):
+        return store.create_item(
+            item_type=item_type,
+            text=text,
+            title=text,
+            work_package_id=wp,
+            attributes=attributes or {},
+        )
+
+    def _populate(self, store):
+        a1 = self._add(store, "wp-a", "Evidence", "a1", {"status": "new", "big": "x" * 50})
+        a2 = self._add(store, "wp-a", "Note", "a2")
+        b1 = self._add(store, "wp-b", "Evidence", "b1")
+        store.flush_writes()
+        return a1, a2, b1
+
+    def test_get_work_packages_across_backends(self) -> None:
+        for backend in ("fs", "sqlite"):
+            with self.subTest(backend=backend):
+                self.tearDown()
+                self.setUp()
+                store = self._make(backend, AdvancingClock())
+                try:
+                    a1, a2, b1 = self._populate(store)
+                    # Fresh instance so the sqlite path goes through the bulk preload.
+                    if backend == "sqlite":
+                        store.close()
+                        store = SqliteTextStore(
+                            f"{self.tempdir.name}/h.sqlite", now_fn=AdvancingClock()
+                        )
+                    result = store.get_work_packages(["wp-a", "wp-b", "wp-missing", "wp-a"])
+                    self.assertEqual(list(result), ["wp-a", "wp-b", "wp-missing"])
+                    self.assertIsNone(result["wp-missing"])
+                    self.assertEqual(
+                        {i["record_sha256"] for i in result["wp-a"]["items"]},
+                        {a1["record_sha256"], a2["record_sha256"]},
+                    )
+                    self.assertEqual(result["wp-a"]["item_count"], 2)
+                    self.assertEqual(
+                        result["wp-a"]["items"],
+                        store.get_work_package("wp-a")["items"],
+                    )
+
+                    typed = store.get_work_packages(["wp-a", "wp-b"], item_type="Note")
+                    self.assertEqual(
+                        [i["record_sha256"] for i in typed["wp-a"]["items"]],
+                        [a2["record_sha256"]],
+                    )
+                    # Package exists but nothing of that type: empty, not null.
+                    self.assertEqual(typed["wp-b"], {"items": [], "item_count": 0})
+
+                    recent = store.get_work_packages(
+                        ["wp-a", "wp-b"], since=a1["created_at"]
+                    )
+                    self.assertEqual(
+                        [i["record_sha256"] for i in recent["wp-a"]["items"]],
+                        [a2["record_sha256"]],
+                    )
+                    self.assertEqual(
+                        [i["record_sha256"] for i in recent["wp-b"]["items"]],
+                        [b1["record_sha256"]],
+                    )
+                    with self.assertRaises(StorageError):
+                        store.get_work_packages(["wp-a"], since="2026-01-01T00:00:00")
+                finally:
+                    getattr(store, "close", lambda: None)()
+
+    def test_sqlite_preload_does_not_clobber_newer_cache(self) -> None:
+        store = self._make("sqlite", AdvancingClock())
+        try:
+            self._add(store, "wp-a", "Evidence", "a1")
+            store.get_work_package("wp-a")  # cached
+            a2 = self._add(store, "wp-a", "Evidence", "a2")  # cache updated on commit
+            result = store.get_work_packages(["wp-a"])
+            self.assertIn(
+                a2["record_sha256"],
+                {i["record_sha256"] for i in result["wp-a"]["items"]},
+            )
+        finally:
+            store.close()
+
+    def test_project_item_dotted_paths(self) -> None:
+        store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        app = MCPApplication(store)
+        item = {
+            "type": "Evidence",
+            "created_at": "2026-11-17T00:00:00+00:00",
+            "attributes": {"status": "new", "nested": {"a": 1, "b": 2}, "big": "x"},
+        }
+        self.assertEqual(
+            app._project_item(
+                item,
+                ["created_at", "attributes.status", "attributes.nested.a",
+                 "attributes.missing", "links.prev"],
+            ),
+            {
+                "created_at": "2026-11-17T00:00:00+00:00",
+                "attributes": {"status": "new", "nested": {"a": 1}},
+            },
+        )
+        # Ancestor wins, in either order; the source item is not mutated.
+        for fields in (
+            ["attributes.status", "attributes"],
+            ["attributes", "attributes.status"],
+        ):
+            self.assertEqual(app._project_item(item, fields), {"attributes": item["attributes"]})
+        self.assertEqual(
+            app._project_item(item, ["attributes.nested", "attributes.nested.a"]),
+            {"attributes": {"nested": {"a": 1, "b": 2}}},
+        )
+        self.assertEqual(set(item["attributes"]), {"status", "nested", "big"})
+        # Top-level projection unchanged.
+        self.assertEqual(app._project_item(item, ["type"]), {"type": "Evidence"})
+        for bad in (["bogus"], ["bogus.x"], ["attributes."], ["attributes..x"]):
+            with self.assertRaises(StorageError):
+                app._project_item(item, bad)
+
+    def test_mcp_tools_project_work_packages(self) -> None:
+        store = TextStore(self.tempdir.name, now_fn=AdvancingClock())
+        store.set_schema(self.SCHEMA)
+        app = MCPApplication(store)
+        self._populate(store)
+
+        def call(name, arguments):
+            response = app.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+            self.assertFalse(response["result"].get("isError"), response)
+            return response["result"]["structuredContent"]
+
+        tools = app.handle_message({"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+        self.assertIn("get_work_packages", {t["name"] for t in tools["result"]["tools"]})
+
+        single = call(
+            "get_work_package",
+            {"work_package_id": "wp-a", "type": "Evidence",
+             "fields": ["title", "attributes.status"]},
+        )
+        self.assertEqual(single["items"], [{"title": "a1", "attributes": {"status": "new"}}])
+        self.assertEqual(single["item_count"], 1)
+
+        full = call("get_work_package", {"work_package_id": "wp-a"})
+        self.assertIn("text", full["items"][0])
+
+        bulk = call(
+            "get_work_packages",
+            {"work_package_ids": ["wp-a", "wp-b", "wp-missing"],
+             "type": "Evidence", "fields": ["title", "attributes.status"]},
+        )["work_packages"]
+        self.assertEqual(bulk["wp-a"]["items"], [{"title": "a1", "attributes": {"status": "new"}}])
+        self.assertEqual(bulk["wp-b"]["items"], [{"title": "b1"}])
+        self.assertIsNone(bulk["wp-missing"])
+
+        oversize = app.handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_work_packages",
+                    "arguments": {"work_package_ids": ["x"] * 10001},
+                },
+            }
+        )
+        self.assertTrue(oversize["result"].get("isError"))
+
+
 if __name__ == "__main__":
     unittest.main()

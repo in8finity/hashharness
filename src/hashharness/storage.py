@@ -891,6 +891,44 @@ class BaseTextStore:
             "item_count": len(items),
         }
 
+    def get_work_packages(
+        self,
+        work_package_ids: list[str],
+        *,
+        item_type: str | None = None,
+        since: str | None = None,
+    ) -> dict[str, dict[str, Any] | None]:
+        """Bulk get_work_package. Keyed by work_package_id; an id with no
+        items at all maps to None. `item_type` filters as in
+        get_work_package; `since` keeps only items created strictly after
+        that ISO 8601 time (timezone required)."""
+        unique_ids = list(dict.fromkeys(work_package_ids))
+        since_dt = None
+        if since is not None:
+            since_dt = datetime.fromisoformat(self._validate_datetime(since))
+        self._preload_work_packages(unique_ids)
+        result: dict[str, dict[str, Any] | None] = {}
+        for work_package_id in unique_ids:
+            cached = self._get_or_load_work_package_cache(work_package_id)
+            items = list(cached.items_by_sha.values())
+            if not items:
+                result[work_package_id] = None
+                continue
+            if item_type:
+                items = [item for item in items if item.get("type") == item_type]
+            if since_dt is not None:
+                items = [
+                    item for item in items
+                    if datetime.fromisoformat(item["created_at"]) > since_dt
+                ]
+            result[work_package_id] = {"items": items, "item_count": len(items)}
+        return result
+
+    def _preload_work_packages(self, work_package_ids: list[str]) -> None:
+        """Hook: load uncached work packages in bulk. Default: no-op, each
+        id is then loaded on its own by _get_or_load_work_package_cache."""
+        return None
+
     def find_tips_bulk(
         self,
         work_package_ids: list[str],
@@ -1040,11 +1078,23 @@ class BaseTextStore:
                 return self.work_package_cache[work_package_id]
 
         items = list(self._backend_iter_items_for_work_package(work_package_id))
+        return self._install_work_package_cache(work_package_id, items)
+
+    def _install_work_package_cache(
+        self,
+        work_package_id: str,
+        items: list[dict[str, Any]],
+        *,
+        replace: bool = True,
+    ) -> CachedWorkPackage:
         cached = CachedWorkPackage(
             items_by_sha={item["text_sha256"]: item for item in items},
             last_used_at=self.clock(),
         )
         with self.cache_lock:
+            if not replace and work_package_id in self.work_package_cache:
+                # Already cached (possibly with writes newer than our read).
+                return self.work_package_cache[work_package_id]
             self._drop_work_package_cache(work_package_id)
             self.work_package_cache[work_package_id] = cached
             for text_sha256, item in cached.items_by_sha.items():
@@ -2290,6 +2340,31 @@ class SqliteTextStore(BaseTextStore):
             item = self._decode_payload(payload, context=text_sha256, strict=False)
             if item is not None:
                 yield item
+
+    def _preload_work_packages(self, work_package_ids: list[str]) -> None:
+        # One IN query per 500 uncached ids instead of one query per id.
+        self._evict_expired_work_packages()
+        with self.cache_lock:
+            missing = [
+                wp_id for wp_id in work_package_ids
+                if wp_id not in self.work_package_cache
+            ]
+        for chunk in _chunked(missing, 500):
+            placeholders = ",".join("?" * len(chunk))
+            with self.db_lock:
+                rows = self.conn.execute(
+                    "SELECT work_package_id, text_sha256, payload FROM items "
+                    f"WHERE work_package_id IN ({placeholders}) "
+                    "ORDER BY work_package_id, text_sha256",
+                    tuple(chunk),
+                ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {wp_id: [] for wp_id in chunk}
+            for wp_id, text_sha256, payload in rows:
+                item = self._decode_payload(payload, context=text_sha256, strict=False)
+                if item is not None:
+                    grouped[wp_id].append(item)
+            for wp_id, items in grouped.items():
+                self._install_work_package_cache(wp_id, items, replace=False)
 
     def list_work_packages(self, prefix: str | None = None) -> list[str]:
         with self.db_lock:
